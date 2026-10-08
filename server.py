@@ -1,6 +1,7 @@
-"""Tocode 文字中转。
+"""Tocode 文字与文件中转。
 
 只保存设备与关联的路由，以及内存中的短期配对码。
+文件字节只在内存中转发，不写入路由文件。
 不写入角色提示词、模型密钥、微信凭据或消息正文。
 生产环境用 --cert 与 --key 启用 TLS。
 """
@@ -23,6 +24,7 @@ from pathlib import Path
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 PAIRING_TTL = 180
 TEXT_LIMIT = 8000
+FILE_LIMIT = 20 * 1024 * 1024
 FORBIDDEN_FIELDS = {
     "prompt",
     "bot_token",
@@ -46,15 +48,20 @@ class Connection:
         self.side = side
         self.owner = owner
         self.lock = asyncio.Lock()
+        self.pending_file = None
 
     async def send(self, payload: dict) -> None:
+        await self.send_bytes(1, json.dumps(payload, ensure_ascii=False).encode())
+
+    async def send_bytes(self, opcode: int, payload: bytes) -> None:
         if self.writer.is_closing():
             raise ConnectionError("closed")
-        frame = encode_frame(1, json.dumps(payload, ensure_ascii=False).encode())
+        frame = encode_frame(opcode, payload)
         async with self.lock:
             self.writer.write(frame)
             try:
-                await asyncio.wait_for(self.writer.drain(), 0.5)
+                timeout = 0.5 if len(payload) < 65536 else min(60, 1 + len(payload) / (256 * 1024))
+                await asyncio.wait_for(self.writer.drain(), timeout)
             except (asyncio.TimeoutError, ConnectionError, OSError):
                 self.writer.close()
                 raise ConnectionError("closed")
@@ -284,7 +291,7 @@ async def read_frame(stream: ByteStream) -> tuple[int, bytes]:
         length = int.from_bytes(await stream.readexactly(2), "big")
     elif length == 127:
         length = int.from_bytes(await stream.readexactly(8), "big")
-    if length > 1_000_000:
+    if length > FILE_LIMIT:
         raise ValueError("frame")
     mask = await stream.readexactly(4) if masked else b""
     payload = await stream.readexactly(length)
@@ -449,8 +456,18 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
                     writer.write(encode_frame(10, payload))
                     await writer.drain()
                 continue
+            if opcode == 2:
+                await on_file_bytes(state, connection, payload)
+                continue
             if opcode != 1:
                 continue
+            if connection.pending_file is not None:
+                connection.pending_file = None
+                await connection.send({
+                    "op": "error",
+                    "code": "bad_op",
+                    "message": "文件帧不完整",
+                })
             await on_text(state, connection, payload.decode())
     except (EOFError, ConnectionError, asyncio.IncompleteReadError, ValueError, json.JSONDecodeError):
         pass
@@ -466,6 +483,136 @@ def path_of(target: str) -> str:
     return target.split("?", 1)[0]
 
 
+def file_size(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
+def safe_file_name(name: str) -> bool:
+    return (
+        bool(name)
+        and len(name) <= 255
+        and "/" not in name
+        and "\\" not in name
+        and "\0" not in name
+        and name not in {".", ".."}
+    )
+
+
+async def begin_file(state: RelayState, connection: Connection, message: dict, op: str, link_id: str, message_id: str) -> None:
+    size = file_size(message.get("size"))
+    name = str(message.get("name") or "")
+    kind = message.get("kind")
+    caption = message.get("text") or ""
+    if not isinstance(caption, str):
+        caption = None
+    valid = (
+        bool(message_id)
+        and size is not None
+        and 0 < size <= FILE_LIMIT
+        and safe_file_name(name)
+        and kind in {"image", "file"}
+        and caption is not None
+        and len(caption) <= TEXT_LIMIT
+    )
+    link = state.links.get(link_id)
+    error = None
+    forward = None
+    if not valid:
+        error = {"op": "error", "code": "empty", "message_id": message_id, "message": "只接受不超过 20MB 的单个文件"}
+    elif link is None:
+        error = {"op": "error", "code": "unknown_link", "message_id": message_id, "message": "关联不存在"}
+    elif connection.side == "android" and op == "file":
+        if connection.owner != link_id:
+            error = {"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能转发别人的关联"}
+        elif state.mac_sockets.get(link["device_id"]) is None:
+            error = {"op": "error", "code": "mac_offline", "message_id": message_id, "message": "Mac 不在线"}
+        else:
+            forward = {
+                "op": "inbound_file",
+                "link_id": link_id,
+                "message_id": message_id,
+                "name": name,
+                "size": size,
+                "kind": kind,
+                "text": caption,
+                "android_id": link["android_id"],
+                "peer": "mac",
+                "peer_id": link["device_id"],
+            }
+    elif connection.side == "mac" and op == "file_reply":
+        if link["device_id"] != connection.owner:
+            error = {"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能回复别人的关联"}
+        elif state.android_sockets.get(link_id) is None:
+            error = {"op": "error", "code": "android_offline", "message_id": message_id, "message": "安卓不在线"}
+        else:
+            forward = {
+                "op": "file",
+                "link_id": link_id,
+                "message_id": message_id,
+                "name": name,
+                "size": size,
+                "kind": kind,
+                "text": caption,
+                "peer": "android",
+                "peer_id": link_id,
+            }
+    else:
+        error = {"op": "error", "code": "bad_op", "message_id": message_id, "message": "无法处理"}
+    if error is not None:
+        await connection.send(error)
+    if size is not None and 0 < size <= FILE_LIMIT:
+        connection.pending_file = {"size": size, "forward": forward, "message_id": message_id}
+    elif forward is not None:
+        connection.pending_file = None
+
+
+async def on_file_bytes(state: RelayState, connection: Connection, payload: bytes) -> None:
+    pending = connection.pending_file
+    connection.pending_file = None
+    if pending is None:
+        await connection.send({"op": "error", "code": "bad_op", "message": "没有对应的文件头"})
+        return
+    if len(payload) != pending["size"]:
+        await connection.send({
+            "op": "error",
+            "code": "empty",
+            "message_id": pending["message_id"],
+            "message": "文件长度不匹配",
+        })
+        return
+    forward = pending["forward"]
+    if forward is None:
+        return
+    peer = state.mac_sockets.get(forward["peer_id"]) if forward["peer"] == "mac" else state.android_sockets.get(forward["peer_id"])
+    header = {key: value for key, value in forward.items() if key not in {"peer", "peer_id"}}
+    try:
+        if peer is None:
+            raise ConnectionError("closed")
+        await peer.send(header)
+        await peer.send_bytes(2, payload)
+    except Exception:
+        if forward["peer"] == "mac":
+            state.mac_sockets.pop(forward["peer_id"], None)
+            code, message = "mac_offline", "Mac 不在线"
+        else:
+            state.android_sockets.pop(forward["peer_id"], None)
+            code, message = "android_offline", "安卓不在线"
+        await connection.send({
+            "op": "error",
+            "code": code,
+            "message_id": pending["message_id"],
+            "message": message,
+        })
+        return
+    await connection.send({"op": "accepted", "message_id": pending["message_id"]})
+
+
 async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
     message = json.loads(raw)
     if any(key in message for key in FORBIDDEN_FIELDS):
@@ -474,6 +621,9 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
     op = message.get("op")
     link_id = str(message.get("link_id") or "")
     message_id = str(message.get("message_id") or "")
+    if op in {"file", "file_reply"}:
+        await begin_file(state, connection, message, op, link_id, message_id)
+        return
     text = message.get("text")
     if op not in {"text", "reply"} or not message_id:
         await connection.send({"op": "error", "code": "bad_op", "message_id": message_id, "message": "无法处理"})

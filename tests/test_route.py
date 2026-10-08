@@ -11,12 +11,21 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import server
 
 
-def encode_client(text: str) -> bytes:
-    payload = text.encode()
+def encode_client_frame(opcode: int, payload: bytes) -> bytes:
     mask = os.urandom(4)
     masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
-    header = bytes([0x81, 0x80 | len(payload)])
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x80 | opcode, 0x80 | length])
+    elif length < 65536:
+        header = bytes([0x80 | opcode, 0x80 | 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([0x80 | opcode, 0x80 | 127]) + length.to_bytes(8, "big")
     return header + mask + masked
+
+
+def encode_client(text: str) -> bytes:
+    return encode_client_frame(1, text.encode())
 
 
 class Socket:
@@ -25,14 +34,21 @@ class Socket:
         self.writer = writer
         self.stream = None
 
+    async def recv_frame(self):
+        return await server.read_frame(self.stream)
+
     async def recv(self):
-        opcode, payload = await server.read_frame(self.stream)
+        opcode, payload = await self.recv_frame()
         if opcode != 1:
             return await self.recv()
         return json.loads(payload.decode())
 
     async def send(self, payload: dict):
         self.writer.write(encode_client(json.dumps(payload)))
+        await self.writer.drain()
+
+    async def send_bytes(self, payload: bytes):
+        self.writer.write(encode_client_frame(2, payload))
         await self.writer.drain()
 
 
@@ -88,6 +104,9 @@ async def http(port: int, method: str, path: str, body: dict | None = None, toke
 class RouteTests(unittest.TestCase):
     def test_pair_forward_and_isolation(self):
         asyncio.run(self._scenario())
+
+    def test_file_forward_stays_out_of_the_route_file(self):
+        asyncio.run(self._file_scenario())
 
     async def _scenario(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +261,125 @@ class RouteTests(unittest.TestCase):
                 self.assertEqual(oct(os.stat(data).st_mode & 0o777), "0o600")
             finally:
                 for sock in locals().get("mac"), locals().get("phone"), locals().get("other"):
+                    if sock is not None:
+                        sock.writer.close()
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+    async def _file_scenario(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                holder["state"] = state
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            mac = phone = None
+            try:
+                _, device = await http(port, "POST", "/v1/devices", {"name": "MacBook"})
+                token = device["device_token"]
+                _, pairing = await http(
+                    port,
+                    "POST",
+                    "/v1/pairings",
+                    {"role_id": "role-1", "role_name": "alpha", "display_name": "Alpha"},
+                    token,
+                )
+                _, link = await http(
+                    port,
+                    "POST",
+                    f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone-a", "android_name": "Pixel"},
+                )
+                mac = await open_ws(port, token)
+                phone = await open_ws(port, link["link_token"])
+                await mac.recv()
+                await phone.recv()
+                body = b"FILEBYTES-MARKER"
+                await phone.send({
+                    "op": "file",
+                    "link_id": link["link_id"],
+                    "message_id": "f1",
+                    "name": "note.txt",
+                    "size": len(body),
+                    "kind": "file",
+                    "text": "请看附件",
+                })
+                await phone.send_bytes(body)
+                header = await mac.recv()
+                opcode, payload = await mac.recv_frame()
+                self.assertEqual(header["op"], "inbound_file")
+                self.assertEqual(header["name"], "note.txt")
+                self.assertEqual(header["text"], "请看附件")
+                self.assertEqual(opcode, 2)
+                self.assertEqual(payload, body)
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await mac.send({
+                    "op": "file_reply",
+                    "link_id": link["link_id"],
+                    "message_id": "back",
+                    "name": "note.txt",
+                    "size": len(body),
+                    "kind": "file",
+                })
+                await mac.send_bytes(body)
+                echoed = await phone.recv()
+                echo_op, echo_body = await phone.recv_frame()
+                self.assertEqual(echoed["op"], "file")
+                self.assertEqual(echoed["name"], "note.txt")
+                self.assertEqual(echo_op, 2)
+                self.assertEqual(echo_body, body)
+                self.assertEqual((await mac.recv())["op"], "accepted")
+
+                await phone.send({
+                    "op": "file",
+                    "link_id": link["link_id"],
+                    "message_id": "big",
+                    "name": "big.bin",
+                    "size": server.FILE_LIMIT + 1,
+                    "kind": "file",
+                })
+                too_big = await phone.recv()
+                self.assertEqual(too_big["code"], "empty")
+
+                await http(port, "DELETE", f"/v1/links/{link['link_id']}", token=token)
+                await phone.send({
+                    "op": "file",
+                    "link_id": link["link_id"],
+                    "message_id": "gone",
+                    "name": "late.txt",
+                    "size": 4,
+                    "kind": "file",
+                })
+                await phone.send_bytes(b"late")
+                denied = await phone.recv()
+                self.assertEqual(denied["code"], "unknown_link")
+
+                raw = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn("FILEBYTES-MARKER", raw)
+                self.assertNotIn("请看附件", raw)
+                self.assertEqual(holder["state"].stored_messages, [])
+            finally:
+                for sock in (mac, phone):
                     if sock is not None:
                         sock.writer.close()
                 holder["server"].close()

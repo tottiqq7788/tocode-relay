@@ -32,3 +32,24 @@
 python3 -m unittest discover -s tests
 python3 ../governance/architecture/tools/audit_project.py --target ../governance
 ```
+
+## 部署
+
+2026-10-08 已部署到 `39.107.140.16`。配对流程不变。文字和不超过 20MB 的单个文件按关联转发，文件字节只在内存中经过，不写入路由文件。进程、数据和配置与 `/srv/totticom`、`/srv/zhouhuocom` 分开。
+
+- 代码：`/srv/relay/server.py`
+- 路由文件：`/srv/relay/data/routes.json`（进程写成 `0600`，只含设备和关联）
+- 服务：`relay.service`，用户 `ecs-user`，监听 `127.0.0.1:8787`
+- 公网：`https://totti.xin/v1/`、`wss://totti.xin/v1/ws`、`https://totti.xin/health`
+- nginx：`/etc/nginx/snippets/relay.conf`，由 `/etc/nginx/conf.d/totticom.conf` 的 443 站点引入
+- `/v1/ws` 关闭访问日志，避免查询串里的令牌落盘
+- 不单独监听公网端口。`http://totti.xin/` 整站跳到 HTTPS
+
+推送与重启：
+
+```text
+rsync -az server.py ecs-user@39.107.140.16:/srv/relay/server.py
+ssh ecs-user@39.107.140.16 sudo systemctl restart relay.service
+```
+
+检查：`systemctl is-active relay.service`，以及 `https://totti.xin/health` 返回 `{"ok": true}`。官网首页和 `https://zhouhuo.totti.xin/` 应仍为 200。
