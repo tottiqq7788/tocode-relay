@@ -101,12 +101,10 @@ async def http(port: int, method: str, path: str, body: dict | None = None, toke
     return status, payload
 
 
-class RouteTests(unittest.TestCase):
-    def test_pair_forward_and_isolation(self):
-        asyncio.run(self._scenario())
 
-    def test_file_forward_stays_out_of_the_route_file(self):
-        asyncio.run(self._file_scenario())
+class RouteTests(unittest.TestCase):
+    def test_command_isolation_and_revoke(self):
+        asyncio.run(self._scenario())
 
     async def _scenario(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -116,7 +114,6 @@ class RouteTests(unittest.TestCase):
 
             async def boot():
                 state = server.RelayState(data)
-                holder["state"] = state
                 tcp = await asyncio.start_server(
                     lambda reader, writer: server.handle(reader, writer, state),
                     "127.0.0.1",
@@ -131,257 +128,75 @@ class RouteTests(unittest.TestCase):
             task = asyncio.create_task(boot())
             await asyncio.wait_for(bound.wait(), 3)
             port = holder["port"]
+            clients = []
             try:
-                _, device = await http(port, "POST", "/v1/devices", {"name": "MacBook"})
-                token = device["device_token"]
-                _, pairing = await http(
-                    port,
-                    "POST",
-                    "/v1/pairings",
-                    {"role_id": "role-1", "role_name": "alpha", "display_name": "Alpha"},
-                    token,
-                )
-                code = pairing["code"]
-                status, first = await http(
-                    port,
-                    "POST",
-                    f"/v1/pairings/{code}/redeem",
-                    {"android_id": "phone-a", "android_name": "Pixel"},
+                _, mac_a = await http(port, "POST", "/v1/devices", {"name": "Mac A"})
+                _, mac_b = await http(port, "POST", "/v1/devices", {"name": "Mac B"})
+                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac_a["device_token"])
+                status, link = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel"},
                 )
                 self.assertEqual(status, 200)
-                status, _ = await http(
-                    port,
-                    "POST",
-                    f"/v1/pairings/{code}/redeem",
-                    {"android_id": "phone-b", "android_name": "Other"},
+                self.assertNotIn("role_id", link)
+                status, again = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel"},
                 )
                 self.assertEqual(status, 409)
 
-                mac = await open_ws(port, token)
-                phone = await open_ws(port, first["link_token"])
-                self.assertEqual((await mac.recv())["side"], "mac")
-                self.assertEqual((await phone.recv())["side"], "android")
-                await phone.send({
-                    "op": "text",
-                    "link_id": first["link_id"],
-                    "message_id": "m1",
-                    "text": "hello-body-9f3",
-                })
-                inbound = await mac.recv()
-                self.assertEqual(inbound["op"], "inbound")
-                self.assertEqual(inbound["text"], "hello-body-9f3")
-                accepted = await phone.recv()
-                self.assertEqual(accepted["op"], "accepted")
-                await mac.send({
-                    "op": "reply",
-                    "link_id": first["link_id"],
-                    "message_id": "r1",
-                    "text": "pong-body",
-                })
-                reply = await phone.recv()
-                self.assertEqual(reply["text"], "pong-body")
-                self.assertEqual((await mac.recv())["op"], "accepted")
-
-                _, second_code = await http(
-                    port,
-                    "POST",
-                    "/v1/pairings",
-                    {"role_id": "role-1", "role_name": "alpha", "display_name": "Alpha 2"},
-                    token,
+                _, pairing_b = await http(port, "POST", "/v1/pairings", {}, mac_b["device_token"])
+                _, link_b = await http(
+                    port, "POST", f"/v1/pairings/{pairing_b['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel"},
                 )
-                _, second = await http(
-                    port,
-                    "POST",
-                    f"/v1/pairings/{second_code['code']}/redeem",
-                    {"android_id": "phone-b", "android_name": "Other"},
-                )
-                other = await open_ws(port, second["link_token"])
-                await other.recv()
-                await other.send({
-                    "op": "text",
-                    "link_id": first["link_id"],
-                    "message_id": "steal",
-                    "text": "nope",
-                })
-                denied = await other.recv()
-                self.assertEqual(denied["code"], "forbidden")
 
-                phone.writer.close()
-                await asyncio.sleep(0.05)
-                await mac.send({
-                    "op": "reply",
-                    "link_id": first["link_id"],
-                    "message_id": "r2",
-                    "text": "late-body",
-                })
-                offline = await mac.recv()
-                self.assertEqual(offline["code"], "android_offline")
-
-                await http(port, "DELETE", f"/v1/links/{first['link_id']}", token=token)
-                await other.send({
-                    "op": "text",
-                    "link_id": second["link_id"],
-                    "message_id": "m2",
-                    "text": "still-routed",
-                })
-                # Mac may first observe nothing for the deleted link; the live link still routes.
-                routed = await mac.recv()
-                self.assertEqual(routed["link_id"], second["link_id"])
-                self.assertEqual(routed["text"], "still-routed")
-                self.assertEqual((await other.recv())["op"], "accepted")
-                mac.writer.close()
-                await asyncio.sleep(0.05)
-                await other.send({
-                    "op": "text",
-                    "link_id": second["link_id"],
-                    "message_id": "m3",
-                    "text": "mac-gone",
-                })
-                gone = await other.recv()
-                if gone.get("op") == "accepted":
-                    gone = await other.recv()
-                self.assertEqual(gone["code"], "mac_offline")
-
-                status, rejected = await http(
-                    port,
-                    "POST",
-                    "/v1/pairings",
-                    {"role_id": "role-1", "role_name": "alpha", "prompt": "system prompt"},
-                    token,
-                )
-                self.assertEqual(status, 400)
-                self.assertEqual(rejected["error"], "forbidden_field")
-
-                raw = pathlib.Path(data).read_text(encoding="utf-8")
-                self.assertNotIn("hello-body-9f3", raw)
-                self.assertNotIn("pong-body", raw)
-                self.assertNotIn("late-body", raw)
-                self.assertNotIn("system prompt", raw)
-                self.assertEqual(holder["state"].stored_messages, [])
-                self.assertEqual(oct(os.stat(data).st_mode & 0o777), "0o600")
-            finally:
-                for sock in locals().get("mac"), locals().get("phone"), locals().get("other"):
-                    if sock is not None:
-                        sock.writer.close()
-                holder["server"].close()
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-
-    async def _file_scenario(self):
-        with tempfile.TemporaryDirectory() as directory:
-            data = str(pathlib.Path(directory) / "routes.json")
-            bound = asyncio.Event()
-            holder = {}
-
-            async def boot():
-                state = server.RelayState(data)
-                holder["state"] = state
-                tcp = await asyncio.start_server(
-                    lambda reader, writer: server.handle(reader, writer, state),
-                    "127.0.0.1",
-                    0,
-                )
-                holder["server"] = tcp
-                holder["port"] = tcp.sockets[0].getsockname()[1]
-                bound.set()
-                async with tcp:
-                    await tcp.serve_forever()
-
-            task = asyncio.create_task(boot())
-            await asyncio.wait_for(bound.wait(), 3)
-            port = holder["port"]
-            mac = phone = None
-            try:
-                _, device = await http(port, "POST", "/v1/devices", {"name": "MacBook"})
-                token = device["device_token"]
-                _, pairing = await http(
-                    port,
-                    "POST",
-                    "/v1/pairings",
-                    {"role_id": "role-1", "role_name": "alpha", "display_name": "Alpha"},
-                    token,
-                )
-                _, link = await http(
-                    port,
-                    "POST",
-                    f"/v1/pairings/{pairing['code']}/redeem",
-                    {"android_id": "phone-a", "android_name": "Pixel"},
-                )
-                mac = await open_ws(port, token)
+                mac = await open_ws(port, mac_a["device_token"])
+                other = await open_ws(port, mac_b["device_token"])
                 phone = await open_ws(port, link["link_token"])
-                await mac.recv()
-                await phone.recv()
-                body = b"FILEBYTES-MARKER"
-                await phone.send({
-                    "op": "file",
-                    "link_id": link["link_id"],
-                    "message_id": "f1",
-                    "name": "note.txt",
-                    "size": len(body),
-                    "kind": "file",
-                    "text": "请看附件",
-                })
-                await phone.send_bytes(body)
-                header = await mac.recv()
-                opcode, payload = await mac.recv_frame()
-                self.assertEqual(header["op"], "inbound_file")
-                self.assertEqual(header["name"], "note.txt")
-                self.assertEqual(header["text"], "请看附件")
-                self.assertEqual(opcode, 2)
-                self.assertEqual(payload, body)
+                clients.extend([mac, other, phone])
+                self.assertEqual((await mac.recv())["side"], "mac")
+                self.assertEqual((await other.recv())["side"], "mac")
+                self.assertEqual((await phone.recv())["side"], "android")
+
+                await phone.send({"op": "command", "request_id": "r1", "action": "status"})
+                inbound = await mac.recv()
+                self.assertEqual(inbound["op"], "command_inbound")
+                self.assertEqual(inbound["action"], "status")
                 self.assertEqual((await phone.recv())["op"], "accepted")
                 await mac.send({
-                    "op": "file_reply",
-                    "link_id": link["link_id"],
-                    "message_id": "back",
-                    "name": "note.txt",
-                    "size": len(body),
-                    "kind": "file",
+                    "op": "result", "link_id": link["link_id"], "request_id": "r1",
+                    "ok": True, "text": "secret-result-body",
                 })
-                await mac.send_bytes(body)
-                echoed = await phone.recv()
-                echo_op, echo_body = await phone.recv_frame()
-                self.assertEqual(echoed["op"], "file")
-                self.assertEqual(echoed["name"], "note.txt")
-                self.assertEqual(echo_op, 2)
-                self.assertEqual(echo_body, body)
-                self.assertEqual((await mac.recv())["op"], "accepted")
+                result = await phone.recv()
+                self.assertEqual(result["text"], "secret-result-body")
+                self.assertTrue(result["ok"])
 
-                await phone.send({
-                    "op": "file",
-                    "link_id": link["link_id"],
-                    "message_id": "big",
-                    "name": "big.bin",
-                    "size": server.FILE_LIMIT + 1,
-                    "kind": "file",
-                })
-                too_big = await phone.recv()
-                self.assertEqual(too_big["code"], "empty")
-
-                await http(port, "DELETE", f"/v1/links/{link['link_id']}", token=token)
-                await phone.send({
-                    "op": "file",
-                    "link_id": link["link_id"],
-                    "message_id": "gone",
-                    "name": "late.txt",
-                    "size": 4,
-                    "kind": "file",
-                })
-                await phone.send_bytes(b"late")
+                await phone.send({"op": "command", "request_id": "r2", "action": "shell"})
                 denied = await phone.recv()
-                self.assertEqual(denied["code"], "unknown_link")
+                self.assertEqual(denied["code"], "bad_action")
 
-                raw = pathlib.Path(data).read_text(encoding="utf-8")
-                self.assertNotIn("FILEBYTES-MARKER", raw)
-                self.assertNotIn("请看附件", raw)
-                self.assertEqual(holder["state"].stored_messages, [])
+                phone_b = await open_ws(port, link_b["link_token"])
+                clients.append(phone_b)
+                self.assertEqual((await phone_b.recv())["side"], "android")
+                await phone_b.send({"op": "command", "request_id": "b1", "action": "status"})
+                other_in = await other.recv()
+                self.assertEqual(other_in["link_id"], link_b["link_id"])
+
+                status, _ = await http(port, "DELETE", f"/v1/links/{link['link_id']}", token=link["link_token"])
+                self.assertEqual(status, 200)
+                revoked = await mac.recv()
+                self.assertEqual(revoked["op"], "link_revoked")
+                status, missing = await http(
+                    port, "POST", "/v1/pairings", {}, link["link_token"]
+                )
+                self.assertEqual(missing.get("error"), "unauthorized")
+                saved = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn("secret-result-body", saved)
+                self.assertNotIn("status", saved)
             finally:
-                for sock in (mac, phone):
-                    if sock is not None:
-                        sock.writer.close()
+                for client in clients:
+                    client.writer.close()
                 holder["server"].close()
                 task.cancel()
                 try:

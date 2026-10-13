@@ -35,7 +35,7 @@ python3 ../governance/architecture/tools/audit_project.py --target ../governance
 
 ## 部署
 
-2026-10-08 已部署到 `39.107.140.16`。配对流程不变。文字和不超过 20MB 的单个文件按关联转发，文件字节只在内存中经过，不写入路由文件。进程、数据和配置与 `/srv/totticom`、`/srv/zhouhuocom` 分开。
+2026-10-12 起按设备关联转发固定遥控动作。动作和结果只在内存中经过，不写入路由文件。旧角色路由不迁移。进程、数据和配置与 `/srv/totticom`、`/srv/zhouhuocom` 分开。
 
 - 代码：`/srv/relay/server.py`
 - 路由文件：`/srv/relay/data/routes.json`（进程写成 `0600`，只含设备和关联）

@@ -1,8 +1,8 @@
-"""Tocode 文字与文件中转。
+"""Tocode 安卓遥控中转。
 
 只保存设备与关联的路由，以及内存中的短期配对码。
-文件字节只在内存中转发，不写入路由文件。
-不写入角色提示词、模型密钥、微信凭据或消息正文。
+动作和结果只在内存中转发，不写入路由文件。
+不写入角色、提示词、模型密钥、微信凭据或命令正文。
 生产环境用 --cert 与 --key 启用 TLS。
 """
 
@@ -34,6 +34,19 @@ FORBIDDEN_FIELDS = {
     "authorization",
 }
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+ACTIONS = {
+    "status",
+    "blackout",
+    "hidden",
+    "finder-follow",
+    "codex-follow",
+    "wheel-vertical",
+    "wheel-horizontal",
+    "finder-move",
+    "finder-cmdq",
+    "double-cmdq",
+    "login",
+}
 
 
 class RelayError(Exception):
@@ -97,20 +110,12 @@ class RelayState:
         device = self.device_for_token(token)
         if device is None:
             raise RelayError(401, "unauthorized")
-        role_id = str(body.get("role_id") or "").strip()
-        role_name = str(body.get("role_name") or "").strip()
-        display_name = str(body.get("display_name") or role_name).strip()
-        if not role_id or not role_name or not display_name:
-            raise RelayError(400, "missing_role")
         self._purge_pairings()
         code = self._new_code()
         self.pairings[code] = {
             "code": code,
             "device_token": token,
             "device_id": device["id"],
-            "role_id": role_id,
-            "role_name": role_name,
-            "display_name": display_name,
             "expires_at": time.time() + PAIRING_TTL,
             "link_id": None,
         }
@@ -148,9 +153,6 @@ class RelayState:
             "id": link_id,
             "device_id": pairing["device_id"],
             "device_name": device["name"],
-            "role_id": pairing["role_id"],
-            "role_name": pairing["role_name"],
-            "display_name": pairing["display_name"],
             "android_id": android_id,
             "android_name": android_name,
             "link_token": link_token,
@@ -162,24 +164,13 @@ class RelayState:
         public["link_token"] = link_token
         return public
 
-    def update_link(self, token: str, link_id: str, body: dict) -> dict:
-        self._reject_forbidden(body)
-        link = self._owned_link(token, link_id)
-        role_id = str(body.get("role_id") or link["role_id"]).strip()
-        role_name = str(body.get("role_name") or link["role_name"]).strip()
-        display_name = str(body.get("display_name") or link["display_name"]).strip()
-        if not role_id or not role_name or not display_name:
-            raise RelayError(400, "missing_role")
-        link["role_id"] = role_id
-        link["role_name"] = role_name
-        link["display_name"] = display_name
-        self._save()
-        return self._public_link(link)
-
-    def delete_link(self, token: str, link_id: str) -> None:
-        self._owned_link(token, link_id)
+    def take_link(self, token: str, link_id: str) -> dict:
+        link = self.links.get(link_id)
+        if link is None or not self._can_manage(token, link):
+            raise RelayError(404, "not_found")
         self.links.pop(link_id, None)
         self._save()
+        return link
 
     def identify(self, token: str) -> tuple[str, str] | None:
         device = self.device_for_token(token)
@@ -193,20 +184,16 @@ class RelayState:
     def links_for_device(self, device_id: str) -> list[str]:
         return [link["id"] for link in self.links.values() if link["device_id"] == device_id]
 
-    def _owned_link(self, token: str, link_id: str) -> dict:
+    def _can_manage(self, token: str, link: dict) -> bool:
         device = self.device_for_token(token)
-        link = self.links.get(link_id)
-        if device is None or link is None or link["device_id"] != device["id"]:
-            raise RelayError(404, "not_found")
-        return link
+        if device is not None and link["device_id"] == device["id"]:
+            return True
+        return hmac.compare_digest(link["link_token"], token)
 
     def _public_link(self, link: dict) -> dict:
         return {
             "link_id": link["id"],
             "device_name": link["device_name"],
-            "role_id": link["role_id"],
-            "role_name": link["role_name"],
-            "display_name": link["display_name"],
             "android_id": link["android_id"],
             "android_name": link["android_name"],
         }
@@ -376,6 +363,17 @@ async def dispatch(reader, writer, state: RelayState) -> None:
     if headers.get("upgrade", "").lower() == "websocket":
         await serve_socket(reader, writer, state, target, headers, leftover)
         return
+    if method == "DELETE" and path.startswith("/v1/links/"):
+        try:
+            removed = state.take_link(bearer(headers), path.removeprefix("/v1/links/"))
+            await notify_revoked(state, removed)
+            result, status = {"ok": True}, 200
+        except RelayError as error:
+            result, status = {"error": error.code}, error.status
+        writer.write(http_response(status, result))
+        await writer.drain()
+        writer.close()
+        return
     try:
         payload = json.loads(body.decode()) if body else {}
         if not isinstance(payload, dict):
@@ -404,11 +402,6 @@ def route_http(state: RelayState, method: str, path: str, headers: dict, body: d
     if method == "POST" and path.startswith("/v1/pairings/") and path.endswith("/redeem"):
         code = path.removeprefix("/v1/pairings/").removesuffix("/redeem").strip("/")
         return state.redeem(code, body), 200
-    if method == "PATCH" and path.startswith("/v1/links/"):
-        return state.update_link(token, path.removeprefix("/v1/links/"), body), 200
-    if method == "DELETE" and path.startswith("/v1/links/"):
-        state.delete_link(token, path.removeprefix("/v1/links/"))
-        return {"ok": True}, 200
     raise RelayError(404, "not_found")
 
 
@@ -457,7 +450,7 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
                     await writer.drain()
                 continue
             if opcode == 2:
-                await on_file_bytes(state, connection, payload)
+                await connection.send({"op": "error", "code": "bad_op", "message": "不接受二进制"})
                 continue
             if opcode != 1:
                 continue
@@ -613,6 +606,23 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
     await connection.send({"op": "accepted", "message_id": pending["message_id"]})
 
 
+async def notify_revoked(state: RelayState, link: dict) -> None:
+    payload = {"op": "link_revoked", "link_id": link["id"]}
+    android = state.android_sockets.pop(link["id"], None)
+    if android is not None:
+        try:
+            await android.send(payload)
+        except Exception:
+            pass
+        android.writer.close()
+    mac = state.mac_sockets.get(link["device_id"])
+    if mac is not None:
+        try:
+            await mac.send(payload)
+        except Exception:
+            state.mac_sockets.pop(link["device_id"], None)
+
+
 async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
     message = json.loads(raw)
     if any(key in message for key in FORBIDDEN_FIELDS):
@@ -620,65 +630,58 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
         return
     op = message.get("op")
     link_id = str(message.get("link_id") or "")
-    message_id = str(message.get("message_id") or "")
-    if op in {"file", "file_reply"}:
-        await begin_file(state, connection, message, op, link_id, message_id)
-        return
-    text = message.get("text")
-    if op not in {"text", "reply"} or not message_id:
-        await connection.send({"op": "error", "code": "bad_op", "message_id": message_id, "message": "无法处理"})
-        return
-    if not isinstance(text, str) or not text.strip() or len(text) > TEXT_LIMIT:
-        await connection.send({"op": "error", "code": "empty", "message_id": message_id, "message": "只接受一段文字"})
-        return
-    link = state.links.get(link_id)
-    if link is None:
-        await connection.send({"op": "error", "code": "unknown_link", "message_id": message_id, "message": "关联不存在"})
-        return
-    if connection.side == "android" and op == "text":
-        if connection.owner != link_id:
-            await connection.send({"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能转发别人的关联"})
+    request_id = str(message.get("request_id") or "")
+    if connection.side == "android" and op == "command":
+        link_id = connection.owner
+        action = str(message.get("action") or "")
+        if action not in ACTIONS or not request_id:
+            await connection.send({"op": "error", "code": "bad_action", "request_id": request_id, "message": "动作不在白名单"})
+            return
+        link = state.links.get(link_id)
+        if link is None:
+            await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
             return
         peer = state.mac_sockets.get(link["device_id"])
         if peer is None:
-            await connection.send({"op": "error", "code": "mac_offline", "message_id": message_id, "message": "Mac 不在线"})
+            await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
         try:
             await peer.send({
-                "op": "inbound",
+                "op": "command_inbound",
                 "link_id": link_id,
-                "message_id": message_id,
-                "text": text,
+                "request_id": request_id,
+                "action": action,
                 "android_id": link["android_id"],
             })
         except Exception:
             state.mac_sockets.pop(link["device_id"], None)
-            await connection.send({"op": "error", "code": "mac_offline", "message_id": message_id, "message": "Mac 不在线"})
+            await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
-        await connection.send({"op": "accepted", "message_id": message_id})
+        await connection.send({"op": "accepted", "request_id": request_id})
         return
-    if connection.side == "mac" and op == "reply":
-        if link["device_id"] != connection.owner:
-            await connection.send({"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能回复别人的关联"})
+    if connection.side == "mac" and op == "result":
+        link = state.links.get(link_id)
+        if link is None or link["device_id"] != connection.owner:
+            await connection.send({"op": "error", "code": "forbidden", "request_id": request_id, "message": "不能回复别人的关联"})
             return
+        text = message.get("text")
+        if not isinstance(text, str):
+            text = ""
         peer = state.android_sockets.get(link_id)
         if peer is None:
-            await connection.send({"op": "error", "code": "android_offline", "message_id": message_id, "message": "安卓不在线"})
             return
         try:
             await peer.send({
-                "op": "reply",
+                "op": "result",
                 "link_id": link_id,
-                "message_id": message_id,
+                "request_id": request_id,
+                "ok": bool(message.get("ok")),
                 "text": text,
             })
         except Exception:
             state.android_sockets.pop(link_id, None)
-            await connection.send({"op": "error", "code": "android_offline", "message_id": message_id, "message": "安卓不在线"})
-            return
-        await connection.send({"op": "accepted", "message_id": message_id})
         return
-    await connection.send({"op": "error", "code": "bad_op", "message_id": message_id, "message": "无法处理"})
+    await connection.send({"op": "error", "code": "bad_op", "request_id": request_id, "message": "无法处理"})
 
 
 async def handle(reader, writer, state: RelayState) -> None:
