@@ -1,7 +1,7 @@
 """Tocode 安卓遥控中转。
 
 只保存设备与关联的路由，以及内存中的短期配对码。
-动作和结果只在内存中转发，不写入路由文件。
+动作、结果、手机对话和目录都只在内存中转发，不写入路由文件。
 不写入角色、提示词、模型密钥、微信凭据或命令正文。
 生产环境用 --cert 与 --key 启用 TLS。
 """
@@ -47,6 +47,9 @@ ACTIONS = {
     "double-cmdq",
     "login",
 }
+APP_KINDS = {"status", "sessions", "session_create", "messages", "chat", "tree"}
+APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text"}
+APP_RESULT_LIMIT = 24000
 
 
 class RelayError(Exception):
@@ -606,6 +609,88 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
     await connection.send({"op": "accepted", "message_id": pending["message_id"]})
 
 
+def app_request_error(message: dict) -> str | None:
+    if set(message) - APP_FIELDS:
+        return "bad_action"
+    kind = str(message.get("kind") or "")
+    if kind not in APP_KINDS or not str(message.get("request_id") or ""):
+        return "bad_action"
+    session_id = message.get("session_id", "")
+    title = message.get("title", "")
+    text = message.get("text", "")
+    if not isinstance(session_id, str) or not isinstance(title, str) or not isinstance(text, str):
+        return "bad_action"
+    if len(session_id) > 256 or len(title) > 80 or len(text) > TEXT_LIMIT:
+        return "bad_action"
+    if any(char in session_id for char in "\r\n\x00/\\"):
+        return "bad_action"
+    return None
+
+
+async def forward_app(state: RelayState, connection: Connection, message: dict, request_id: str) -> None:
+    if app_request_error(message):
+        await connection.send({"op": "error", "code": "bad_action", "request_id": request_id, "message": "动作不在白名单"})
+        return
+    link = state.links.get(connection.owner)
+    if link is None:
+        await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
+        return
+    peer = state.mac_sockets.get(link["device_id"])
+    if peer is None:
+        await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
+        return
+    forwarded = {
+        "op": "app_inbound",
+        "link_id": connection.owner,
+        "request_id": request_id,
+        "kind": message.get("kind"),
+        "session_id": message.get("session_id", ""),
+        "title": message.get("title", ""),
+        "text": message.get("text", ""),
+    }
+    try:
+        await peer.send(forwarded)
+    except Exception:
+        state.mac_sockets.pop(link["device_id"], None)
+        await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
+        return
+    await connection.send({"op": "accepted", "request_id": request_id})
+
+
+async def forward_app_result(state: RelayState, connection: Connection, message: dict, link_id: str, request_id: str) -> None:
+    allowed = {"op", "link_id", "request_id", "ok", "text", "kind", "body"}
+    if set(message) - allowed:
+        await connection.send({"op": "error", "code": "bad_action", "request_id": request_id, "message": "动作不在白名单"})
+        return
+    link = state.links.get(link_id)
+    if link is None or link["device_id"] != connection.owner:
+        await connection.send({"op": "error", "code": "forbidden", "request_id": request_id, "message": "不能回复别人的关联"})
+        return
+    text = message.get("text") if isinstance(message.get("text"), str) else ""
+    body = message.get("body") if isinstance(message.get("body"), dict) else {}
+    payload = {
+        "op": "app_result",
+        "link_id": link_id,
+        "request_id": request_id,
+        "kind": str(message.get("kind") or ""),
+        "ok": bool(message.get("ok")),
+        "text": text[:TEXT_LIMIT],
+        "body": body,
+    }
+    encoded = json.dumps(payload, ensure_ascii=False)
+    if len(encoded) > APP_RESULT_LIMIT:
+        payload["body"] = {}
+        payload["text"] = "内容太长"
+        payload["ok"] = False
+    peer = state.android_sockets.get(link_id)
+    if peer is None:
+        return
+    try:
+        await peer.send(payload)
+    except Exception:
+        state.android_sockets.pop(link_id, None)
+
+
 async def notify_revoked(state: RelayState, link: dict) -> None:
     payload = {"op": "link_revoked", "link_id": link["id"]}
     android = state.android_sockets.pop(link["id"], None)
@@ -658,6 +743,12 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
             await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
         await connection.send({"op": "accepted", "request_id": request_id})
+        return
+    if connection.side == "android" and op == "app":
+        await forward_app(state, connection, message, request_id)
+        return
+    if connection.side == "mac" and op == "app_result":
+        await forward_app_result(state, connection, message, link_id, request_id)
         return
     if connection.side == "mac" and op == "result":
         link = state.links.get(link_id)

@@ -205,5 +205,87 @@ class RouteTests(unittest.TestCase):
                     pass
 
 
+class AppChannelTests(unittest.TestCase):
+    def test_app_channel_is_separate_and_not_stored(self):
+        asyncio.run(self._scenario())
+
+    async def _scenario(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            clients = []
+            try:
+                _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac["device_token"])
+                _, link = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel"},
+                )
+                mac_ws = await open_ws(port, mac["device_token"])
+                phone = await open_ws(port, link["link_token"])
+                clients.extend([mac_ws, phone])
+                self.assertEqual((await mac_ws.recv())["side"], "mac")
+                self.assertEqual((await phone.recv())["side"], "android")
+
+                await phone.send({
+                    "op": "app", "request_id": "c1", "kind": "chat", "text": "CHAT_SECRET_BODY",
+                    "path": "/tmp/nope",
+                })
+                denied = await phone.recv()
+                self.assertEqual(denied["code"], "bad_action")
+
+                await phone.send({"op": "app", "request_id": "c2", "kind": "chat", "text": "CHAT_SECRET_BODY"})
+                inbound = await mac_ws.recv()
+                self.assertEqual(inbound["op"], "app_inbound")
+                self.assertNotIn("path", inbound)
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await mac_ws.send({
+                    "op": "app_result",
+                    "link_id": link["link_id"],
+                    "request_id": "c2",
+                    "kind": "chat",
+                    "ok": True,
+                    "text": "REPLY_SECRET_BODY",
+                    "body": {"entries": [{"name": "DIR_SECRET_NAME", "path": "src", "kind": "directory"}]},
+                })
+                result = await phone.recv()
+                self.assertEqual(result["op"], "app_result")
+                self.assertEqual(result["text"], "REPLY_SECRET_BODY")
+                saved = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn("CHAT_SECRET_BODY", saved)
+                self.assertNotIn("REPLY_SECRET_BODY", saved)
+                self.assertNotIn("DIR_SECRET_NAME", saved)
+
+                await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+            finally:
+                for client in clients:
+                    client.writer.close()
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()
