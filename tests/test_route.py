@@ -159,10 +159,11 @@ class RouteTests(unittest.TestCase):
                 self.assertEqual((await other.recv())["side"], "mac")
                 self.assertEqual((await phone.recv())["side"], "android")
 
-                await phone.send({"op": "command", "request_id": "r1", "action": "status"})
+                await phone.send({"op": "command", "request_id": "r1", "action": "remote-buttons"})
                 inbound = await mac.recv()
                 self.assertEqual(inbound["op"], "command_inbound")
-                self.assertEqual(inbound["action"], "status")
+                self.assertEqual(inbound["action"], "remote-buttons")
+                self.assertNotIn("target", inbound)
                 self.assertEqual((await phone.recv())["op"], "accepted")
                 await mac.send({
                     "op": "result", "link_id": link["link_id"], "request_id": "r1",
@@ -174,16 +175,33 @@ class RouteTests(unittest.TestCase):
 
                 await phone.send({"op": "command", "request_id": "w1", "action": "wheel-vertical"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({"op": "command", "request_id": "st1", "action": "status"})
+                self.assertEqual((await phone.recv())["code"], "bad_action")
                 await phone.send({
                     "op": "command", "request_id": "bd1", "action": "blackout",
                     "target": {"display_id": "d1", "space_id": 7},
                 })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({"op": "command", "request_id": "bd2", "action": "blackout-dismiss"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
                 await phone.send({
                     "op": "command", "request_id": "lk1", "action": "lock",
                     "target": {"display_id": "d1", "space_id": 7},
                 })
                 self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "command", "request_id": "rp0", "action": "remote-press",
+                    "target": {"button_id": "abc", "shortcut": "secret"},
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "command", "request_id": "rp1", "action": "remote-press",
+                    "target": {"button_id": "6f1c1c1c-1c1c-4c1c-8c1c-1c1c1c1c1c1c"},
+                })
+                inbound = await mac.recv()
+                self.assertEqual(inbound["action"], "remote-press")
+                self.assertEqual(inbound["target"], {"button_id": "6f1c1c1c-1c1c-4c1c-8c1c-1c1c1c1c1c1c"})
+                self.assertEqual((await phone.recv())["op"], "accepted")
                 await phone.send({"op": "command", "request_id": "ds0", "action": "desktop-switch"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
                 await phone.send({
@@ -210,7 +228,7 @@ class RouteTests(unittest.TestCase):
                 phone_b = await open_ws(port, link_b["link_token"])
                 clients.append(phone_b)
                 self.assertEqual((await phone_b.recv())["side"], "android")
-                await phone_b.send({"op": "command", "request_id": "b1", "action": "status"})
+                await phone_b.send({"op": "command", "request_id": "b1", "action": "desktops"})
                 other_in = await other.recv()
                 self.assertEqual(other_in["link_id"], link_b["link_id"])
 
@@ -225,6 +243,7 @@ class RouteTests(unittest.TestCase):
                 saved = pathlib.Path(data).read_text(encoding="utf-8")
                 self.assertNotIn("secret-result-body", saved)
                 self.assertNotIn("桌面窗口标题不会落盘", saved)
+                self.assertNotIn("6f1c1c1c-1c1c-4c1c-8c1c-1c1c1c1c1c1c", saved)
                 self.assertNotIn("status", saved)
             finally:
                 for client in clients:

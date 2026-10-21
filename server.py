@@ -36,12 +36,10 @@ FORBIDDEN_FIELDS = {
 }
 CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ACTIONS = {
-    "status",
-    "blackout",
-    "blackout-dismiss",
-    "lock",
     "desktops",
     "desktop-switch",
+    "remote-buttons",
+    "remote-press",
 }
 APP_KINDS = {
     "status", "sessions", "session_create", "messages", "chat", "tree",
@@ -617,6 +615,18 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
 def command_target_error(message: dict) -> str | None:
     action = str(message.get("action") or "")
     target = message.get("target")
+    if action == "remote-press":
+        if not isinstance(target, dict) or set(target) != {"button_id"}:
+            return "bad_action"
+        button_id = target.get("button_id")
+        if (
+            not isinstance(button_id, str)
+            or not button_id.strip()
+            or len(button_id) > 80
+            or any(ch.isspace() for ch in button_id)
+        ):
+            return "bad_action"
+        return None
     if action != "desktop-switch":
         return "bad_action" if "target" in message else None
     if not isinstance(target, dict) or set(target) - {"display_id", "space_id", "window_id", "pid"}:
@@ -807,6 +817,8 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
                     "window_id": target.get("window_id", 0),
                     "pid": target.get("pid", 0),
                 }
+            elif action == "remote-press":
+                forwarded["target"] = {"button_id": message["target"]["button_id"]}
             await peer.send(forwarded)
         except Exception:
             state.mac_sockets.pop(link["device_id"], None)
