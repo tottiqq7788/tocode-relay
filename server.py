@@ -48,7 +48,7 @@ APP_KINDS = {
 }
 APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset"}
 PATH_LIMIT = 1024
-PATH_KINDS = {"folders", "project_create", "preview"}
+PATH_KINDS = {"folders", "project_create", "preview", "tree"}
 PREVIEW_RESULT_LIMIT = 200_000
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PROJECT_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,64}$")
@@ -792,7 +792,7 @@ def app_request_error(message: dict) -> str | None:
         return "bad_action"
     if "offset" in message:
         offset = message.get("offset")
-        if kind != "preview" or isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > 5_000_000:
+        if kind not in {"preview", "tree"} or isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > 5_000_000:
             return "bad_action"
     return None
 
@@ -832,7 +832,7 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
     }
     if forwarded["kind"] in PATH_KINDS:
         forwarded["path"] = message.get("path", "")
-    if forwarded["kind"] == "preview":
+    if forwarded["kind"] in {"preview", "tree"}:
         forwarded["offset"] = message.get("offset", 0)
     try:
         await peer.send(forwarded)
@@ -864,7 +864,7 @@ async def forward_app_result(state: RelayState, connection: Connection, message:
         "body": body,
     }
     encoded = json.dumps(payload, ensure_ascii=False)
-    limit = PREVIEW_RESULT_LIMIT if payload["kind"] == "preview" else APP_RESULT_LIMIT
+    limit = PREVIEW_RESULT_LIMIT if payload["kind"] in {"preview", "tree"} else APP_RESULT_LIMIT
     if len(encoded) > limit:
         payload["body"] = {}
         payload["text"] = "内容太长"

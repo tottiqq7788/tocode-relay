@@ -401,6 +401,28 @@ class AppChannelTests(unittest.TestCase):
                 self.assertEqual((await phone.recv())["code"], "bad_action")
                 self.assertNotIn("PREVIEW_SECRET", pathlib.Path(data).read_text(encoding="utf-8"))
 
+                await phone.send({
+                    "op": "app", "request_id": "t1", "kind": "tree",
+                    "profile": "liubei", "project_id": "p_abc12345",
+                    "path": "chapters", "offset": 80,
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "tree")
+                self.assertEqual(routed["path"], "chapters")
+                self.assertEqual(routed["offset"], 80)
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await phone.send({
+                    "op": "app", "request_id": "t2", "kind": "tree",
+                    "path": "chapters", "offset": -1,
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "app", "request_id": "t3", "kind": "tree",
+                    "path": "../chapters",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                self.assertNotIn("chapters", pathlib.Path(data).read_text(encoding="utf-8"))
+
                 await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
             finally:
