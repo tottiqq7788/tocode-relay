@@ -306,6 +306,35 @@ class AppChannelTests(unittest.TestCase):
                 self.assertEqual((await phone.recv())["op"], "accepted")
                 self.assertNotIn("PATH_SECRET_NAME", pathlib.Path(data).read_text(encoding="utf-8"))
 
+                await phone.send({
+                    "op": "app", "request_id": "d1", "kind": "session_delete",
+                    "session_id": "api_x", "profile": "liubei", "project_id": "p_abc12345",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "session_delete")
+                self.assertEqual(routed["session_id"], "api_x")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+
+                await phone.send({
+                    "op": "app", "request_id": "n1", "kind": "session_rename",
+                    "session_id": "api_x", "title": "TITLE_SECRET_NAME",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "session_rename")
+                self.assertEqual(routed["title"], "TITLE_SECRET_NAME")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                self.assertNotIn("TITLE_SECRET_NAME", pathlib.Path(data).read_text(encoding="utf-8"))
+
+                await phone.send({
+                    "op": "app", "request_id": "p1", "kind": "preview",
+                    "profile": "liubei", "project_id": "p_abc12345", "path": "src/PREVIEW_SECRET.md",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "preview")
+                self.assertEqual(routed["path"], "src/PREVIEW_SECRET.md")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                self.assertNotIn("PREVIEW_SECRET", pathlib.Path(data).read_text(encoding="utf-8"))
+
                 await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
             finally:

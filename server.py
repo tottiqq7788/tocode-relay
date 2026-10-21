@@ -51,10 +51,12 @@ ACTIONS = {
 APP_KINDS = {
     "status", "sessions", "session_create", "messages", "chat", "tree",
     "profiles", "profile_select", "projects", "project_create", "folders",
+    "session_delete", "session_rename", "preview",
 }
 APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path"}
 PATH_LIMIT = 1024
-PATH_KINDS = {"folders", "project_create"}
+PATH_KINDS = {"folders", "project_create", "preview"}
+PREVIEW_RESULT_LIMIT = 200_000
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PROJECT_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,64}$")
 APP_RESULT_LIMIT = 24000
@@ -711,7 +713,8 @@ async def forward_app_result(state: RelayState, connection: Connection, message:
         "body": body,
     }
     encoded = json.dumps(payload, ensure_ascii=False)
-    if len(encoded) > APP_RESULT_LIMIT:
+    limit = PREVIEW_RESULT_LIMIT if payload["kind"] == "preview" else APP_RESULT_LIMIT
+    if len(encoded) > limit:
         payload["body"] = {}
         payload["text"] = "内容太长"
         payload["ok"] = False
