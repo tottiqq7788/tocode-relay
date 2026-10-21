@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import ssl
 import time
@@ -47,8 +48,15 @@ ACTIONS = {
     "double-cmdq",
     "login",
 }
-APP_KINDS = {"status", "sessions", "session_create", "messages", "chat", "tree"}
-APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text"}
+APP_KINDS = {
+    "status", "sessions", "session_create", "messages", "chat", "tree",
+    "profiles", "profile_select", "projects", "project_create", "folders",
+}
+APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path"}
+PATH_LIMIT = 1024
+PATH_KINDS = {"folders", "project_create"}
+PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+PROJECT_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,64}$")
 APP_RESULT_LIMIT = 24000
 
 
@@ -618,13 +626,34 @@ def app_request_error(message: dict) -> str | None:
     session_id = message.get("session_id", "")
     title = message.get("title", "")
     text = message.get("text", "")
+    profile = message.get("profile", "")
+    project_id = message.get("project_id", "")
     if not isinstance(session_id, str) or not isinstance(title, str) or not isinstance(text, str):
+        return "bad_action"
+    if not isinstance(profile, str) or not isinstance(project_id, str):
         return "bad_action"
     if len(session_id) > 256 or len(title) > 80 or len(text) > TEXT_LIMIT:
         return "bad_action"
     if any(char in session_id for char in "\r\n\x00/\\"):
         return "bad_action"
+    if profile and PROFILE_RE.fullmatch(profile) is None:
+        return "bad_action"
+    if project_id and PROJECT_RE.fullmatch(project_id) is None:
+        return "bad_action"
+    path = message.get("path", "")
+    if not valid_home_path(path) or (path and kind not in PATH_KINDS):
+        return "bad_action"
     return None
+
+
+def valid_home_path(path: object) -> bool:
+    if not isinstance(path, str) or len(path) > PATH_LIMIT:
+        return False
+    if path == "":
+        return True
+    if path.startswith("/") or any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return False
+    return all(part not in {"", ".", ".."} for part in path.split("/"))
 
 
 async def forward_app(state: RelayState, connection: Connection, message: dict, request_id: str) -> None:
@@ -647,7 +676,11 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
         "session_id": message.get("session_id", ""),
         "title": message.get("title", ""),
         "text": message.get("text", ""),
+        "profile": message.get("profile", ""),
+        "project_id": message.get("project_id", ""),
     }
+    if forwarded["kind"] in PATH_KINDS:
+        forwarded["path"] = message.get("path", "")
     try:
         await peer.send(forwarded)
     except Exception:

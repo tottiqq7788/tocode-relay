@@ -274,6 +274,38 @@ class AppChannelTests(unittest.TestCase):
                 self.assertNotIn("REPLY_SECRET_BODY", saved)
                 self.assertNotIn("DIR_SECRET_NAME", saved)
 
+                await phone.send({
+                    "op": "app", "request_id": "c3", "kind": "projects",
+                    "profile": "../x", "project_id": "p_abc12345",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+
+                await phone.send({
+                    "op": "app", "request_id": "c4", "kind": "projects",
+                    "profile": "liubei", "project_id": "p_abc12345",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["profile"], "liubei")
+                self.assertEqual(routed["project_id"], "p_abc12345")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                saved = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn("liubei", saved)
+                self.assertNotIn("p_abc12345", saved)
+
+                for index, bad in enumerate(["/etc", "code/../..", "./code", "code//app", "code/\x00", "a" * 1025]):
+                    await phone.send({"op": "app", "request_id": f"f{index}", "kind": "folders", "path": bad})
+                    self.assertEqual((await phone.recv())["code"], "bad_action")
+
+                await phone.send({"op": "app", "request_id": "f8", "kind": "chat", "session_id": "api_x", "text": "hi", "path": "code"})
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+
+                await phone.send({"op": "app", "request_id": "f9", "kind": "folders", "path": "code/PATH_SECRET_NAME"})
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "folders")
+                self.assertEqual(routed["path"], "code/PATH_SECRET_NAME")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                self.assertNotIn("PATH_SECRET_NAME", pathlib.Path(data).read_text(encoding="utf-8"))
+
                 await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
             finally:
