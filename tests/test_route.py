@@ -423,6 +423,34 @@ class AppChannelTests(unittest.TestCase):
                 self.assertEqual((await phone.recv())["code"], "bad_action")
                 self.assertNotIn("chapters", pathlib.Path(data).read_text(encoding="utf-8"))
 
+                await phone.send({
+                    "op": "app", "request_id": "m1", "kind": "messages",
+                    "session_id": "api_x", "cursor": "tail:0",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "messages")
+                self.assertEqual(routed["cursor"], "tail:0")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await phone.send({
+                    "op": "app", "request_id": "m2", "kind": "messages",
+                    "session_id": "api_x", "cursor": "older:15",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["cursor"], "older:15")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await phone.send({
+                    "op": "app", "request_id": "m3", "kind": "chat",
+                    "text": "hi", "cursor": "tail:1",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "app", "request_id": "m4", "kind": "messages",
+                    "session_id": "api_x", "cursor": "older:0",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                self.assertNotIn("tail:0", pathlib.Path(data).read_text(encoding="utf-8"))
+                self.assertNotIn("older:15", pathlib.Path(data).read_text(encoding="utf-8"))
+
                 await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
                 self.assertEqual((await phone.recv())["code"], "bad_action")
             finally:

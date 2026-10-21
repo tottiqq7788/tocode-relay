@@ -46,7 +46,8 @@ APP_KINDS = {
     "profiles", "profile_select", "projects", "project_create", "folders",
     "session_delete", "session_rename", "preview",
 }
-APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset"}
+APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset", "cursor"}
+CURSOR_RE = re.compile(r"^(tail|older):[0-9]{1,20}$")
 PATH_LIMIT = 1024
 PATH_KINDS = {"folders", "project_create", "preview", "tree"}
 PREVIEW_RESULT_LIMIT = 200_000
@@ -885,6 +886,12 @@ def app_request_error(message: dict) -> str | None:
         offset = message.get("offset")
         if kind not in {"preview", "tree"} or isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > 5_000_000:
             return "bad_action"
+    if "cursor" in message:
+        cursor = message.get("cursor")
+        if kind != "messages" or not isinstance(cursor, str) or CURSOR_RE.fullmatch(cursor) is None:
+            return "bad_action"
+        if cursor.startswith("older:") and int(cursor.split(":", 1)[1]) <= 0:
+            return "bad_action"
     return None
 
 
@@ -925,6 +932,8 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
         forwarded["path"] = message.get("path", "")
     if forwarded["kind"] in {"preview", "tree"}:
         forwarded["offset"] = message.get("offset", 0)
+    if forwarded["kind"] == "messages" and message.get("cursor"):
+        forwarded["cursor"] = message["cursor"]
     try:
         await peer.send(forwarded)
     except Exception:
