@@ -1,7 +1,7 @@
 """Tocode 安卓遥控中转。
 
 只保存设备与关联的路由，以及内存中的短期配对码。
-动作、结果、手机对话和目录都只在内存中转发，不写入路由文件。
+动作、结果、手机对话、目录和附件都只在内存中转发，不写入路由文件。
 不写入角色、提示词、模型密钥、微信凭据或命令正文。
 生产环境用 --cert 与 --key 启用 TLS。
 """
@@ -52,6 +52,8 @@ PATH_KINDS = {"folders", "project_create", "preview"}
 PREVIEW_RESULT_LIMIT = 200_000
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PROJECT_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,64}$")
+PROJECT_FILE_FIELDS = {"op", "request_id", "name", "size", "kind", "profile", "project_id"}
+ATTACHMENT_PREFIXES = ("对话附件-图片/", "对话附件-文件/")
 APP_RESULT_LIMIT = 24000
 
 
@@ -456,15 +458,20 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
                     await writer.drain()
                 continue
             if opcode == 2:
-                await connection.send({"op": "error", "code": "bad_op", "message": "不接受二进制"})
+                if connection.pending_file is None:
+                    await connection.send({"op": "error", "code": "bad_op", "message": "不接受二进制"})
+                    continue
+                await on_file_bytes(state, connection, payload)
                 continue
             if opcode != 1:
                 continue
             if connection.pending_file is not None:
+                pending = connection.pending_file
                 connection.pending_file = None
                 await connection.send({
                     "op": "error",
                     "code": "bad_op",
+                    "request_id": pending.get("message_id", ""),
                     "message": "文件帧不完整",
                 })
             await on_text(state, connection, payload.decode())
@@ -492,6 +499,18 @@ def file_size(value) -> int | None:
     return None
 
 
+def attachment_path(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    folder = next((prefix for prefix in ATTACHMENT_PREFIXES if value.startswith(prefix)), None)
+    if folder is None:
+        return None
+    name = value[len(folder):]
+    if not safe_file_name(name):
+        return None
+    return value
+
+
 def safe_file_name(name: str) -> bool:
     return (
         bool(name)
@@ -501,6 +520,97 @@ def safe_file_name(name: str) -> bool:
         and "\0" not in name
         and name not in {".", ".."}
     )
+
+
+async def begin_project_file(state: RelayState, connection: Connection, message: dict) -> None:
+    request_id = str(message.get("request_id") or "")
+
+    def reject(text: str) -> dict:
+        return {"op": "error", "code": "bad_action", "request_id": request_id, "message": text}
+
+    if set(message) - PROJECT_FILE_FIELDS:
+        await connection.send(reject("不能指定保存位置"))
+        return
+    name = message.get("name")
+    kind = message.get("kind")
+    profile = message.get("profile", "")
+    project_id = message.get("project_id", "")
+    size = file_size(message.get("size"))
+    if (
+        not request_id
+        or len(request_id) > 80
+        or not isinstance(name, str)
+        or not safe_file_name(name)
+        or kind not in {"image", "file"}
+        or not isinstance(profile, str)
+        or (profile and PROFILE_RE.fullmatch(profile) is None)
+        or not isinstance(project_id, str)
+        or PROJECT_RE.fullmatch(project_id) is None
+        or size is None
+        or not 0 < size <= FILE_LIMIT
+    ):
+        await connection.send(reject("无法保存这个文件"))
+        return
+    if connection.pending_file is not None:
+        await connection.send(reject("上一个文件还没传完"))
+        return
+    link_id = connection.owner
+    link = state.links.get(link_id)
+    if link is None:
+        await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
+        return
+    if state.mac_sockets.get(link["device_id"]) is None:
+        await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
+        return
+    connection.pending_file = {
+        "size": size,
+        "message_id": request_id,
+        "forward": {
+            "op": "project_file_inbound",
+            "link_id": link_id,
+            "request_id": request_id,
+            "name": name,
+            "size": size,
+            "kind": kind,
+            "profile": profile,
+            "project_id": project_id,
+            "peer": "mac",
+            "peer_id": link["device_id"],
+        },
+    }
+
+
+async def forward_project_file_result(state: RelayState, connection: Connection, message: dict, link_id: str, request_id: str) -> None:
+    link = state.links.get(link_id)
+    if link is None or link["device_id"] != connection.owner:
+        await connection.send({"op": "error", "code": "forbidden", "request_id": request_id, "message": "不能回复别人的关联"})
+        return
+    text = message.get("text")
+    if not isinstance(text, str):
+        text = ""
+    if len(text) > 500:
+        text = text[:500]
+    ok = bool(message.get("ok"))
+    path = attachment_path(message.get("path")) if ok else None
+    if ok and path is None:
+        ok = False
+        text = "路径无效"
+    peer = state.android_sockets.get(link_id)
+    if peer is None:
+        return
+    payload = {
+        "op": "project_file_result",
+        "link_id": link_id,
+        "request_id": request_id,
+        "ok": ok,
+        "text": text,
+    }
+    if ok and path is not None:
+        payload["path"] = path
+    try:
+        await peer.send(payload)
+    except Exception:
+        state.android_sockets.pop(link_id, None)
 
 
 async def begin_file(state: RelayState, connection: Connection, message: dict, op: str, link_id: str, message_id: str) -> None:
@@ -582,6 +692,7 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
             "op": "error",
             "code": "empty",
             "message_id": pending["message_id"],
+            "request_id": pending["message_id"],
             "message": "文件长度不匹配",
         })
         return
@@ -606,10 +717,15 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
             "op": "error",
             "code": code,
             "message_id": pending["message_id"],
+            "request_id": pending["message_id"],
             "message": message,
         })
         return
-    await connection.send({"op": "accepted", "message_id": pending["message_id"]})
+    await connection.send({
+        "op": "accepted",
+        "message_id": pending["message_id"],
+        "request_id": pending["message_id"],
+    })
 
 
 def command_target_error(message: dict) -> str | None:
@@ -829,8 +945,14 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
     if connection.side == "android" and op == "app":
         await forward_app(state, connection, message, request_id)
         return
+    if connection.side == "android" and op == "project_file":
+        await begin_project_file(state, connection, message)
+        return
     if connection.side == "mac" and op == "app_result":
         await forward_app_result(state, connection, message, link_id, request_id)
+        return
+    if connection.side == "mac" and op == "project_file_result":
+        await forward_project_file_result(state, connection, message, link_id, request_id)
         return
     if connection.side == "mac" and op == "result":
         link = state.links.get(link_id)

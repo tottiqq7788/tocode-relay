@@ -414,5 +414,106 @@ class AppChannelTests(unittest.TestCase):
                     pass
 
 
+    def test_project_file_stays_in_memory(self):
+        asyncio.run(self._project_file())
+
+    async def _project_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            clients = []
+            try:
+                _, mac_a = await http(port, "POST", "/v1/devices", {"name": "Mac A"})
+                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac_a["device_token"])
+                _, link = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel"},
+                )
+                mac = await open_ws(port, mac_a["device_token"])
+                phone = await open_ws(port, link["link_token"])
+                clients.extend([mac, phone])
+                self.assertEqual((await mac.recv())["side"], "mac")
+                self.assertEqual((await phone.recv())["side"], "android")
+
+                await phone.send_bytes(b"NOPE")
+                self.assertEqual((await phone.recv())["message"], "不接受二进制")
+                await phone.send({
+                    "op": "project_file", "request_id": "bad-path", "name": "a.jpg", "size": 4,
+                    "kind": "image", "profile": "default", "project_id": "p_demo1",
+                    "path": "对话附件-图片/a.jpg",
+                })
+                refused = await phone.recv()
+                self.assertEqual(refused["code"], "bad_action")
+                self.assertEqual(refused["message"], "不能指定保存位置")
+                await phone.send({
+                    "op": "project_file", "request_id": "bad-name", "name": "../a.jpg", "size": 4,
+                    "kind": "file", "profile": "default", "project_id": "p_demo1",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(mac.recv(), 0.3)
+
+                await phone.send({
+                    "op": "project_file", "request_id": "f1", "name": "attach-marker.jpg", "size": 11,
+                    "kind": "image", "profile": "default", "project_id": "p_demo1",
+                })
+                await phone.send_bytes(b"ATTACHBYTES")
+                header = await mac.recv()
+                self.assertEqual(header["op"], "project_file_inbound")
+                self.assertEqual(header["name"], "attach-marker.jpg")
+                self.assertEqual(header["kind"], "image")
+                self.assertEqual(header["project_id"], "p_demo1")
+                self.assertNotIn("path", header)
+                opcode, payload = await mac.recv_frame()
+                self.assertEqual(opcode, 2)
+                self.assertEqual(payload, b"ATTACHBYTES")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "f1",
+                    "ok": True, "path": "对话附件-图片/attach-marker.jpg",
+                })
+                saved_path = await phone.recv()
+                self.assertTrue(saved_path["ok"])
+                self.assertEqual(saved_path["path"], "对话附件-图片/attach-marker.jpg")
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "f2",
+                    "ok": True, "path": "/tmp/secret",
+                })
+                denied = await phone.recv()
+                self.assertFalse(denied["ok"])
+                self.assertNotIn("path", denied)
+                stored = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn("ATTACHBYTES", stored)
+                self.assertNotIn("attach-marker.jpg", stored)
+                self.assertNotIn("对话附件", stored)
+            finally:
+                for client in clients:
+                    client.writer.close()
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()
