@@ -544,6 +544,21 @@ class AppChannelTests(unittest.TestCase):
                 self.assertEqual(held["hold_id"], "11111111-1111-1111-1111-111111111111")
                 self.assertNotIn("path", held)
                 await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "both",
+                    "ok": True, "hold_id": "11111111-1111-1111-1111-111111111111",
+                    "path": "对话附件-图片/staged.jpg",
+                })
+                both = await phone.recv()
+                self.assertTrue(both["ok"])
+                self.assertEqual(both["hold_id"], "11111111-1111-1111-1111-111111111111")
+                self.assertEqual(both["path"], "对话附件-图片/staged.jpg")
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "bad-both",
+                    "ok": True, "hold_id": "11111111-1111-1111-1111-111111111111",
+                    "path": "/etc/passwd",
+                })
+                self.assertFalse((await phone.recv())["ok"])
+                await mac.send({
                     "op": "project_file_result", "link_id": link["link_id"], "request_id": "bad-hold",
                     "ok": True, "hold_id": "../outside",
                 })

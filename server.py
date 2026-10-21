@@ -661,21 +661,26 @@ async def forward_project_file_result(state: RelayState, connection: Connection,
     ok = bool(message.get("ok"))
     dropped = message.get("dropped") is True
     ident = held_id(message.get("hold_id")) if ok and not dropped else None
-    path = attachment_path(message.get("path")) if ok and not dropped and ident is None else None
+    raw_path = message.get("path")
+    path = attachment_path(raw_path) if ok and not dropped else None
     if ok and dropped:
-        if message.get("path") not in {None, ""} or message.get("hold_id") not in {None, ""}:
+        if raw_path not in {None, ""} or message.get("hold_id") not in {None, ""}:
             ok = False
             dropped = False
             text = "路径无效"
-    elif ok and ident is not None and path is None:
-        if message.get("path") not in {None, ""}:
+    elif ok and ident is not None and path is not None:
+        pass
+    elif ok and ident is not None:
+        if raw_path not in {None, ""}:
             ok = False
             ident = None
             text = "路径无效"
-    elif ok and path is not None:
-        ident = None
+    elif ok and path is not None and message.get("hold_id") in {None, ""}:
+        pass
     elif ok:
         ok = False
+        path = None
+        ident = None
         text = "路径无效"
     peer = state.android_sockets.get(link_id)
     if peer is None:
