@@ -52,7 +52,10 @@ PATH_KINDS = {"folders", "project_create", "preview", "tree"}
 PREVIEW_RESULT_LIMIT = 200_000
 PROFILE_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 PROJECT_RE = re.compile(r"^p_[A-Za-z0-9_-]{1,64}$")
-PROJECT_FILE_FIELDS = {"op", "request_id", "name", "size", "kind", "profile", "project_id"}
+PROJECT_FILE_FIELDS = {"op", "request_id", "name", "size", "kind", "profile", "project_id", "hold"}
+PLACE_FIELDS = {"op", "request_id", "hold_id", "profile", "project_id"}
+DROP_FIELDS = {"op", "request_id", "hold_id"}
+HOLD_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 ATTACHMENT_PREFIXES = ("对话附件-图片/", "对话附件-文件/")
 APP_RESULT_LIMIT = 24000
 
@@ -531,6 +534,10 @@ async def begin_project_file(state: RelayState, connection: Connection, message:
     if set(message) - PROJECT_FILE_FIELDS:
         await connection.send(reject("不能指定保存位置"))
         return
+    hold = message.get("hold", False)
+    if hold is not False and hold is not True:
+        await connection.send(reject("无法保存这个文件"))
+        return
     name = message.get("name")
     kind = message.get("kind")
     profile = message.get("profile", "")
@@ -578,6 +585,67 @@ async def begin_project_file(state: RelayState, connection: Connection, message:
             "peer_id": link["device_id"],
         },
     }
+    if hold:
+        connection.pending_file["forward"]["hold"] = True
+
+
+def held_id(value) -> str | None:
+    if isinstance(value, str) and HOLD_RE.fullmatch(value):
+        return value
+    return None
+
+
+async def begin_held_file(state: RelayState, connection: Connection, message: dict, placing: bool) -> None:
+    request_id = str(message.get("request_id") or "")
+
+    def reject(text: str) -> dict:
+        return {"op": "error", "code": "bad_action", "request_id": request_id, "message": text}
+
+    if set(message) - (PLACE_FIELDS if placing else DROP_FIELDS):
+        await connection.send(reject("不能指定保存位置"))
+        return
+    ident = held_id(message.get("hold_id"))
+    profile = message.get("profile", "")
+    project_id = message.get("project_id", "")
+    if (
+        not request_id
+        or len(request_id) > 80
+        or ident is None
+        or (
+            placing
+            and (
+                not isinstance(profile, str)
+                or (profile and PROFILE_RE.fullmatch(profile) is None)
+                or not isinstance(project_id, str)
+                or PROJECT_RE.fullmatch(project_id) is None
+            )
+        )
+    ):
+        await connection.send(reject("无法保存这个文件"))
+        return
+    link_id = connection.owner
+    link = state.links.get(link_id)
+    if link is None:
+        await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
+        return
+    peer = state.mac_sockets.get(link["device_id"])
+    if peer is None:
+        await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
+        return
+    payload = {
+        "op": "project_file_place" if placing else "project_file_drop",
+        "link_id": link_id,
+        "request_id": request_id,
+        "hold_id": ident,
+    }
+    if placing:
+        payload["profile"] = profile
+        payload["project_id"] = project_id
+    try:
+        await peer.send(payload)
+    except Exception:
+        state.mac_sockets.pop(link["device_id"], None)
+        await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
 
 
 async def forward_project_file_result(state: RelayState, connection: Connection, message: dict, link_id: str, request_id: str) -> None:
@@ -591,8 +659,22 @@ async def forward_project_file_result(state: RelayState, connection: Connection,
     if len(text) > 500:
         text = text[:500]
     ok = bool(message.get("ok"))
-    path = attachment_path(message.get("path")) if ok else None
-    if ok and path is None:
+    dropped = message.get("dropped") is True
+    ident = held_id(message.get("hold_id")) if ok and not dropped else None
+    path = attachment_path(message.get("path")) if ok and not dropped and ident is None else None
+    if ok and dropped:
+        if message.get("path") not in {None, ""} or message.get("hold_id") not in {None, ""}:
+            ok = False
+            dropped = False
+            text = "路径无效"
+    elif ok and ident is not None and path is None:
+        if message.get("path") not in {None, ""}:
+            ok = False
+            ident = None
+            text = "路径无效"
+    elif ok and path is not None:
+        ident = None
+    elif ok:
         ok = False
         text = "路径无效"
     peer = state.android_sockets.get(link_id)
@@ -607,6 +689,10 @@ async def forward_project_file_result(state: RelayState, connection: Connection,
     }
     if ok and path is not None:
         payload["path"] = path
+    if ok and ident is not None:
+        payload["hold_id"] = ident
+    if ok and dropped:
+        payload["dropped"] = True
     try:
         await peer.send(payload)
     except Exception:
@@ -947,6 +1033,12 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
         return
     if connection.side == "android" and op == "project_file":
         await begin_project_file(state, connection, message)
+        return
+    if connection.side == "android" and op == "project_file_place":
+        await begin_held_file(state, connection, message, placing=True)
+        return
+    if connection.side == "android" and op == "project_file_drop":
+        await begin_held_file(state, connection, message, placing=False)
         return
     if connection.side == "mac" and op == "app_result":
         await forward_app_result(state, connection, message, link_id, request_id)

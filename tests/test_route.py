@@ -522,9 +522,74 @@ class AppChannelTests(unittest.TestCase):
                 denied = await phone.recv()
                 self.assertFalse(denied["ok"])
                 self.assertNotIn("path", denied)
+                await phone.send({
+                    "op": "project_file", "request_id": "h1", "name": "staged.jpg", "size": 4,
+                    "kind": "image", "profile": "default", "project_id": "p_demo1", "hold": True,
+                })
+                await phone.send_bytes(b"HOLD")
+                held_header = await mac.recv()
+                self.assertEqual(held_header["op"], "project_file_inbound")
+                self.assertIs(held_header["hold"], True)
+                self.assertNotIn("path", held_header)
+                opcode, payload = await mac.recv_frame()
+                self.assertEqual(opcode, 2)
+                self.assertEqual(payload, b"HOLD")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "h1",
+                    "ok": True, "hold_id": "11111111-1111-1111-1111-111111111111",
+                })
+                held = await phone.recv()
+                self.assertTrue(held["ok"])
+                self.assertEqual(held["hold_id"], "11111111-1111-1111-1111-111111111111")
+                self.assertNotIn("path", held)
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "bad-hold",
+                    "ok": True, "hold_id": "../outside",
+                })
+                self.assertFalse((await phone.recv())["ok"])
+                await phone.send({
+                    "op": "project_file_place", "request_id": "p1",
+                    "hold_id": "11111111-1111-1111-1111-111111111111",
+                    "profile": "default", "project_id": "p_demo1", "path": "对话附件-图片/x.jpg",
+                })
+                self.assertEqual((await phone.recv())["message"], "不能指定保存位置")
+                await phone.send({
+                    "op": "project_file_place", "request_id": "p1",
+                    "hold_id": "11111111-1111-1111-1111-111111111111",
+                    "profile": "default", "project_id": "p_demo1",
+                })
+                placed = await mac.recv()
+                self.assertEqual(placed["op"], "project_file_place")
+                self.assertEqual(placed["hold_id"], "11111111-1111-1111-1111-111111111111")
+                self.assertNotIn("path", placed)
+                self.assertNotIn("name", placed)
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "p1",
+                    "ok": True, "path": "对话附件-图片/staged.jpg",
+                })
+                final = await phone.recv()
+                self.assertEqual(final["path"], "对话附件-图片/staged.jpg")
+                await phone.send({
+                    "op": "project_file_drop", "request_id": "d1",
+                    "hold_id": "11111111-1111-1111-1111-111111111111",
+                })
+                dropped_in = await mac.recv()
+                self.assertEqual(dropped_in["op"], "project_file_drop")
+                self.assertNotIn("path", dropped_in)
+                await mac.send({
+                    "op": "project_file_result", "link_id": link["link_id"], "request_id": "d1",
+                    "ok": True, "dropped": True,
+                })
+                gone = await phone.recv()
+                self.assertTrue(gone["dropped"])
+                self.assertNotIn("path", gone)
                 stored = pathlib.Path(data).read_text(encoding="utf-8")
                 self.assertNotIn("ATTACHBYTES", stored)
+                self.assertNotIn("HOLD", stored)
                 self.assertNotIn("attach-marker.jpg", stored)
+                self.assertNotIn("staged.jpg", stored)
+                self.assertNotIn("11111111-1111-1111-1111-111111111111", stored)
                 self.assertNotIn("对话附件", stored)
             finally:
                 for client in clients:
