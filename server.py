@@ -38,22 +38,17 @@ CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 ACTIONS = {
     "status",
     "blackout",
-    "hidden",
-    "finder-follow",
-    "codex-follow",
-    "wheel-vertical",
-    "wheel-horizontal",
-    "finder-move",
-    "finder-cmdq",
-    "double-cmdq",
-    "login",
+    "blackout-dismiss",
+    "lock",
+    "desktops",
+    "desktop-switch",
 }
 APP_KINDS = {
     "status", "sessions", "session_create", "messages", "chat", "tree",
     "profiles", "profile_select", "projects", "project_create", "folders",
     "session_delete", "session_rename", "preview",
 }
-APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path"}
+APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset"}
 PATH_LIMIT = 1024
 PATH_KINDS = {"folders", "project_create", "preview"}
 PREVIEW_RESULT_LIMIT = 200_000
@@ -619,6 +614,30 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
     await connection.send({"op": "accepted", "message_id": pending["message_id"]})
 
 
+def command_target_error(message: dict) -> str | None:
+    action = str(message.get("action") or "")
+    target = message.get("target")
+    if action != "desktop-switch":
+        return "bad_action" if "target" in message else None
+    if not isinstance(target, dict) or set(target) - {"display_id", "space_id", "window_id", "pid"}:
+        return "bad_action"
+    display_id = target.get("display_id")
+    space_id = target.get("space_id")
+    window_id = target.get("window_id", 0)
+    pid = target.get("pid", 0)
+    if not isinstance(display_id, str) or not display_id.strip() or len(display_id) > 128:
+        return "bad_action"
+    if isinstance(space_id, bool) or not isinstance(space_id, int) or space_id < 0:
+        return "bad_action"
+    if isinstance(window_id, bool) or not isinstance(window_id, int) or window_id < 0:
+        return "bad_action"
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0 or pid > 2**31 - 1:
+        return "bad_action"
+    if (window_id == 0) != (pid == 0):
+        return "bad_action"
+    return None
+
+
 def app_request_error(message: dict) -> str | None:
     if set(message) - APP_FIELDS:
         return "bad_action"
@@ -645,6 +664,10 @@ def app_request_error(message: dict) -> str | None:
     path = message.get("path", "")
     if not valid_home_path(path) or (path and kind not in PATH_KINDS):
         return "bad_action"
+    if "offset" in message:
+        offset = message.get("offset")
+        if kind != "preview" or isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset > 5_000_000:
+            return "bad_action"
     return None
 
 
@@ -683,6 +706,8 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
     }
     if forwarded["kind"] in PATH_KINDS:
         forwarded["path"] = message.get("path", "")
+    if forwarded["kind"] == "preview":
+        forwarded["offset"] = message.get("offset", 0)
     try:
         await peer.send(forwarded)
     except Exception:
@@ -755,7 +780,7 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
     if connection.side == "android" and op == "command":
         link_id = connection.owner
         action = str(message.get("action") or "")
-        if action not in ACTIONS or not request_id:
+        if action not in ACTIONS or not request_id or command_target_error(message):
             await connection.send({"op": "error", "code": "bad_action", "request_id": request_id, "message": "动作不在白名单"})
             return
         link = state.links.get(link_id)
@@ -767,13 +792,22 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
             await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
         try:
-            await peer.send({
+            forwarded = {
                 "op": "command_inbound",
                 "link_id": link_id,
                 "request_id": request_id,
                 "action": action,
                 "android_id": link["android_id"],
-            })
+            }
+            if action == "desktop-switch":
+                target = message["target"]
+                forwarded["target"] = {
+                    "display_id": target["display_id"],
+                    "space_id": target["space_id"],
+                    "window_id": target.get("window_id", 0),
+                    "pid": target.get("pid", 0),
+                }
+            await peer.send(forwarded)
         except Exception:
             state.mac_sockets.pop(link["device_id"], None)
             await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
@@ -797,14 +831,20 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
         peer = state.android_sockets.get(link_id)
         if peer is None:
             return
+        payload = {
+            "op": "result",
+            "link_id": link_id,
+            "request_id": request_id,
+            "ok": bool(message.get("ok")),
+            "text": text,
+        }
+        body = message.get("body")
+        if isinstance(body, dict):
+            encoded = json.dumps(body, ensure_ascii=False)
+            if len(encoded) <= PREVIEW_RESULT_LIMIT:
+                payload["body"] = body
         try:
-            await peer.send({
-                "op": "result",
-                "link_id": link_id,
-                "request_id": request_id,
-                "ok": bool(message.get("ok")),
-                "text": text,
-            })
+            await peer.send(payload)
         except Exception:
             state.android_sockets.pop(link_id, None)
         return

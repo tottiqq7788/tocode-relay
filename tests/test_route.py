@@ -172,6 +172,37 @@ class RouteTests(unittest.TestCase):
                 self.assertEqual(result["text"], "secret-result-body")
                 self.assertTrue(result["ok"])
 
+                await phone.send({"op": "command", "request_id": "w1", "action": "wheel-vertical"})
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "command", "request_id": "bd1", "action": "blackout",
+                    "target": {"display_id": "d1", "space_id": 7},
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "command", "request_id": "lk1", "action": "lock",
+                    "target": {"display_id": "d1", "space_id": 7},
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({"op": "command", "request_id": "ds0", "action": "desktop-switch"})
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+                await phone.send({
+                    "op": "command", "request_id": "ds1", "action": "desktop-switch",
+                    "target": {"display_id": "d1", "space_id": 7, "window_id": 11, "pid": 4},
+                })
+                inbound = await mac.recv()
+                self.assertEqual(inbound["action"], "desktop-switch")
+                self.assertEqual(inbound["target"]["display_id"], "d1")
+                self.assertEqual(inbound["target"]["window_id"], 11)
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await mac.send({
+                    "op": "result", "link_id": link["link_id"], "request_id": "ds1",
+                    "ok": True, "text": "已切换",
+                    "body": {"displays": [{"title": "桌面窗口标题不会落盘", "spaces": []}]},
+                })
+                listed = await phone.recv()
+                self.assertEqual(listed["body"]["displays"][0]["title"], "桌面窗口标题不会落盘")
+
                 await phone.send({"op": "command", "request_id": "r2", "action": "shell"})
                 denied = await phone.recv()
                 self.assertEqual(denied["code"], "bad_action")
@@ -193,6 +224,7 @@ class RouteTests(unittest.TestCase):
                 self.assertEqual(missing.get("error"), "unauthorized")
                 saved = pathlib.Path(data).read_text(encoding="utf-8")
                 self.assertNotIn("secret-result-body", saved)
+                self.assertNotIn("桌面窗口标题不会落盘", saved)
                 self.assertNotIn("status", saved)
             finally:
                 for client in clients:
@@ -332,7 +364,22 @@ class AppChannelTests(unittest.TestCase):
                 routed = await mac_ws.recv()
                 self.assertEqual(routed["kind"], "preview")
                 self.assertEqual(routed["path"], "src/PREVIEW_SECRET.md")
+                self.assertEqual(routed["offset"], 0)
                 self.assertEqual((await phone.recv())["op"], "accepted")
+
+                await phone.send({
+                    "op": "app", "request_id": "p2", "kind": "preview",
+                    "profile": "liubei", "project_id": "p_abc12345", "path": "src/PREVIEW_SECRET.md",
+                    "offset": 12000,
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["offset"], 12000)
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await phone.send({
+                    "op": "app", "request_id": "p3", "kind": "preview",
+                    "path": "src/a.md", "offset": -1,
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
                 self.assertNotIn("PREVIEW_SECRET", pathlib.Path(data).read_text(encoding="utf-8"))
 
                 await phone.send({"op": "command", "request_id": "s1", "action": "shell"})
