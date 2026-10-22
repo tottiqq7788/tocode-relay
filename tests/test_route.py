@@ -424,6 +424,15 @@ class AppChannelTests(unittest.TestCase):
                 self.assertEqual(routed["offset"], 80)
                 self.assertEqual((await phone.recv())["op"], "accepted")
                 await phone.send({
+                    "op": "app", "request_id": "dl1", "kind": "download",
+                    "profile": "liubei", "project_id": "p_abc12345",
+                    "text": '["src/a.md","chapters"]',
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "download")
+                self.assertEqual(routed["text"], '["src/a.md","chapters"]')
+                self.assertEqual((await phone.recv())["op"], "accepted")
+                await phone.send({
                     "op": "app", "request_id": "t2", "kind": "tree",
                     "path": "chapters", "offset": -1,
                 })

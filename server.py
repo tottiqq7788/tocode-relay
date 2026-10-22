@@ -44,7 +44,7 @@ ACTIONS = {
 APP_KINDS = {
     "status", "sessions", "session_create", "messages", "chat", "tree",
     "profiles", "profile_select", "projects", "project_create", "folders",
-    "session_delete", "session_rename", "preview",
+    "session_delete", "session_rename", "preview", "download",
 }
 APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset", "cursor"}
 CURSOR_RE = re.compile(r"^(tail|older):[0-9]{1,20}$")
