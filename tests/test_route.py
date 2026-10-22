@@ -744,5 +744,97 @@ class BindingKeyTests(unittest.IsolatedAsyncioTestCase):
                     pass
 
 
+class DiagTests(unittest.TestCase):
+    def test_sanitize_blocks_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server.configure_diag(directory)
+            server.diag(
+                "app.forward",
+                link_id="link-1",
+                device_id="mac-1",
+                request_id="r1",
+                kind="chat",
+                token="secret-token",
+                binding_key="mac-key",
+                text="hello body",
+                path="/Users/me/secret.txt",
+                ok=True,
+            )
+            day = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y%m%d")
+            path = pathlib.Path(directory) / f"relay-{day}.jsonl"
+            self.assertTrue(path.is_file())
+            row = json.loads(path.read_text(encoding="utf-8").strip().splitlines()[-1])
+            self.assertEqual(row["event"], "app.forward")
+            self.assertEqual(row["link_id"], "link-1")
+            self.assertEqual(row["device_id"], "mac-1")
+            self.assertEqual(row["request_id"], "r1")
+            detail = row.get("detail") or {}
+            self.assertEqual(detail.get("kind"), "chat")
+            self.assertTrue(detail.get("ok"))
+            blob = path.read_text(encoding="utf-8")
+            self.assertNotIn("secret-token", blob)
+            self.assertNotIn("mac-key", blob)
+            self.assertNotIn("hello body", blob)
+            self.assertNotIn("/Users/me", blob)
+            self.assertNotIn("token", blob)
+            self.assertNotIn("binding_key", blob)
+            self.assertNotIn("\"text\"", blob)
+            self.assertNotIn("\"path\"", blob)
+
+    def test_ws_close_is_logged(self):
+        asyncio.run(self._ws_close())
+
+    async def _ws_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            diag_dir = pathlib.Path(directory) / "diagnostics"
+            server.configure_diag(str(diag_dir))
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            try:
+                _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+                sock = await open_ws(port, mac["device_token"])
+                ready = await sock.recv()
+                self.assertEqual(ready["side"], "mac")
+                sock.writer.close()
+                await asyncio.sleep(0.3)
+                day = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).strftime("%Y%m%d")
+                log = diag_dir / f"relay-{day}.jsonl"
+                self.assertTrue(log.is_file())
+                lines = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+                events = [row["event"] for row in lines]
+                self.assertIn("ws.accept", events)
+                self.assertIn("ws.close", events)
+                close = next(row for row in lines if row["event"] == "ws.close")
+                self.assertEqual(close["device_id"], mac["device_id"])
+                self.assertIn(close.get("detail", {}).get("reason"), {"eof", "ws_close", "connection_error", "incomplete_read"})
+                blob = log.read_text(encoding="utf-8")
+                self.assertNotIn(mac["device_token"], blob)
+            finally:
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()

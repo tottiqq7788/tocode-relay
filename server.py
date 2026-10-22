@@ -18,11 +18,82 @@ import os
 import re
 import secrets
 import ssl
+import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+DIAG_BLOCKED = {
+    "token", "device_token", "link_token", "authorization", "binding_key",
+    "binding_key_digest", "text", "content", "body", "path", "caption",
+    "bytes", "data", "password", "secret", "prompt", "api_key", "bot_token",
+}
+_diag_lock = threading.Lock()
+_diag_dir: Path | None = None
+
+
+def configure_diag(path: str | None) -> None:
+    global _diag_dir
+    if path:
+        _diag_dir = Path(path)
+    else:
+        env = os.environ.get("TOCODE_DIAG_DIR", "").strip()
+        _diag_dir = Path(env) if env else Path("diagnostics")
+
+
+def diag(event: str, **fields) -> None:
+    """本地 JSONL 诊断；永不写 token/正文。失败静默。"""
+    if _diag_dir is None:
+        return
+    row = {
+        "ts": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "side": "relay",
+        "event": event,
+    }
+    detail = {}
+    for key, value in fields.items():
+        lower = key.lower()
+        if lower in DIAG_BLOCKED or "token" in lower or "secret" in lower or "password" in lower:
+            continue
+        if key in {"link_id", "device_id", "corr", "request_id"}:
+            if isinstance(value, str) and value:
+                row[key] = value[:128]
+            continue
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float)):
+            detail[key] = value
+        elif isinstance(value, str):
+            detail[key] = value[:240]
+        else:
+            detail[key] = str(value)[:80]
+    if detail:
+        row["detail"] = detail
+    line = json.dumps(row, ensure_ascii=False) + "\n"
+    try:
+        with _diag_lock:
+            _diag_dir.mkdir(parents=True, exist_ok=True)
+            day = datetime.now(timezone.utc).strftime("%Y%m%d")
+            target = _diag_dir / f"relay-{day}.jsonl"
+            if target.exists() and target.stat().st_size > 8 * 1024 * 1024:
+                return
+            with target.open("a", encoding="utf-8") as handle:
+                handle.write(line)
+            _prune_diag(_diag_dir)
+    except Exception:
+        return
+
+
+def _prune_diag(folder: Path) -> None:
+    cutoff = time.time() - 7 * 86400
+    try:
+        for item in folder.glob("relay-*.jsonl"):
+            if item.stat().st_mtime < cutoff:
+                item.unlink(missing_ok=True)
+    except Exception:
+        return
 PAIRING_TTL = 180
 TEXT_LIMIT = 8000
 FILE_LIMIT = 20 * 1024 * 1024
@@ -453,15 +524,19 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
     await writer.drain()
     side, owner = identity
     connection = Connection(writer, side, owner)
+    close_reason = "unknown"
     if side == "mac":
         previous = state.mac_sockets.get(owner)
         state.mac_sockets[owner] = connection
         ready = {"op": "ready", "side": "mac", "link_ids": state.links_for_device(owner)}
+        diag("ws.accept", device_id=owner, side_peer="mac", links=len(ready["link_ids"]))
     else:
         previous = state.android_sockets.get(owner)
         state.android_sockets[owner] = connection
         ready = {"op": "ready", "side": "android", "link_id": owner}
+        diag("ws.accept", link_id=owner, side_peer="android")
     if previous is not None and previous is not connection:
+        diag("ws.replace", device_id=owner if side == "mac" else "", link_id=owner if side == "android" else "", side_peer=side)
         previous.writer.close()
     try:
         await connection.send(ready)
@@ -469,6 +544,7 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
         while True:
             opcode, payload = await read_frame(stream)
             if opcode == 8:
+                close_reason = "ws_close"
                 break
             if opcode == 9:
                 async with connection.lock:
@@ -493,13 +569,23 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
                     "message": "文件帧不完整",
                 })
             await on_text(state, connection, payload.decode())
-    except (EOFError, ConnectionError, asyncio.IncompleteReadError, ValueError, json.JSONDecodeError):
-        pass
+    except EOFError:
+        close_reason = "eof"
+    except ConnectionError:
+        close_reason = "connection_error"
+    except asyncio.IncompleteReadError:
+        close_reason = "incomplete_read"
+    except ValueError:
+        close_reason = "frame_error"
+    except json.JSONDecodeError:
+        close_reason = "json_error"
     finally:
         if side == "mac" and state.mac_sockets.get(owner) is connection:
             state.mac_sockets.pop(owner, None)
+            diag("ws.close", device_id=owner, reason=close_reason, side_peer="mac")
         if side == "android" and state.android_sockets.get(owner) is connection:
             state.android_sockets.pop(owner, None)
+            diag("ws.close", link_id=owner, reason=close_reason, side_peer="android")
         writer.close()
 
 
@@ -582,6 +668,7 @@ async def begin_project_file(state: RelayState, connection: Connection, message:
         await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
         return
     if state.mac_sockets.get(link["device_id"]) is None:
+        diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind="project_file_inbound", reason="missing_socket")
         await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
         return
     connection.pending_file = {
@@ -645,6 +732,7 @@ async def begin_held_file(state: RelayState, connection: Connection, message: di
         return
     peer = state.mac_sockets.get(link["device_id"])
     if peer is None:
+        diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind="project_file", reason="missing_socket")
         await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
         return
     payload = {
@@ -660,6 +748,7 @@ async def begin_held_file(state: RelayState, connection: Connection, message: di
         await peer.send(payload)
     except Exception:
         state.mac_sockets.pop(link["device_id"], None)
+        diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind="project_file", reason="send_failed")
         await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
 
 
@@ -717,6 +806,7 @@ async def forward_project_file_result(state: RelayState, connection: Connection,
         await peer.send(payload)
     except Exception:
         state.android_sockets.pop(link_id, None)
+        diag("peer_send_fail", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind="project_file_result", side_peer="android")
 
 
 async def begin_file(state: RelayState, connection: Connection, message: dict, op: str, link_id: str, message_id: str) -> None:
@@ -746,6 +836,7 @@ async def begin_file(state: RelayState, connection: Connection, message: dict, o
         if connection.owner != link_id:
             error = {"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能转发别人的关联"}
         elif state.mac_sockets.get(link["device_id"]) is None:
+            diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=message_id, kind="file", reason="missing_socket")
             error = {"op": "error", "code": "mac_offline", "message_id": message_id, "message": "Mac 不在线"}
         else:
             forward = {
@@ -764,6 +855,7 @@ async def begin_file(state: RelayState, connection: Connection, message: dict, o
         if link["device_id"] != connection.owner:
             error = {"op": "error", "code": "forbidden", "message_id": message_id, "message": "不能回复别人的关联"}
         elif state.android_sockets.get(link_id) is None:
+            diag("forward.android_offline", link_id=link_id, device_id=link["device_id"], request_id=message_id, kind="file_reply", reason="missing_socket")
             error = {"op": "error", "code": "android_offline", "message_id": message_id, "message": "安卓不在线"}
         else:
             forward = {
@@ -816,9 +908,24 @@ async def on_file_bytes(state: RelayState, connection: Connection, payload: byte
         if forward["peer"] == "mac":
             state.mac_sockets.pop(forward["peer_id"], None)
             code, message = "mac_offline", "Mac 不在线"
+            diag(
+                "forward.mac_offline",
+                link_id=forward.get("link_id", ""),
+                device_id=forward["peer_id"],
+                request_id=pending["message_id"],
+                kind="file_bytes",
+                reason="send_failed",
+            )
         else:
             state.android_sockets.pop(forward["peer_id"], None)
             code, message = "android_offline", "安卓不在线"
+            diag(
+                "forward.android_offline",
+                link_id=forward.get("link_id", ""),
+                request_id=pending["message_id"],
+                kind="file_bytes",
+                reason="send_failed",
+            )
         await connection.send({
             "op": "error",
             "code": code,
@@ -927,8 +1034,10 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
     if link is None:
         await connection.send({"op": "error", "code": "unknown_link", "request_id": request_id, "message": "关联不存在"})
         return
+    kind = str(message.get("kind") or "")
     peer = state.mac_sockets.get(link["device_id"])
     if peer is None:
+        diag("forward.mac_offline", link_id=connection.owner, device_id=link["device_id"], request_id=request_id, kind=kind, reason="missing_socket")
         await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
         return
     forwarded = {
@@ -948,10 +1057,19 @@ async def forward_app(state: RelayState, connection: Connection, message: dict, 
         forwarded["offset"] = message.get("offset", 0)
     if forwarded["kind"] == "messages" and message.get("cursor"):
         forwarded["cursor"] = message["cursor"]
+    diag(
+        "app.forward",
+        link_id=connection.owner,
+        device_id=link["device_id"],
+        request_id=request_id,
+        kind=kind,
+        has_path=bool(forwarded.get("path")),
+    )
     try:
         await peer.send(forwarded)
     except Exception:
         state.mac_sockets.pop(link["device_id"], None)
+        diag("forward.mac_offline", link_id=connection.owner, device_id=link["device_id"], request_id=request_id, kind=kind, reason="send_failed")
         await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
         return
     await connection.send({"op": "accepted", "request_id": request_id})
@@ -985,14 +1103,17 @@ async def forward_app_result(state: RelayState, connection: Connection, message:
         payload["ok"] = False
     peer = state.android_sockets.get(link_id)
     if peer is None:
+        diag("forward.android_offline", link_id=link_id, device_id=connection.owner, request_id=request_id, kind=payload.get("kind", ""), reason="missing_socket")
         return
     try:
         await peer.send(payload)
     except Exception:
         state.android_sockets.pop(link_id, None)
+        diag("peer_send_fail", link_id=link_id, device_id=connection.owner, request_id=request_id, kind=payload.get("kind", ""), side_peer="android")
 
 
 async def notify_revoked(state: RelayState, link: dict) -> None:
+    diag("link.revoked", link_id=link.get("id", ""), device_id=link.get("device_id", ""))
     payload = {"op": "link_revoked", "link_id": link["id"]}
     android = state.android_sockets.pop(link["id"], None)
     if android is not None:
@@ -1029,6 +1150,7 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
             return
         peer = state.mac_sockets.get(link["device_id"])
         if peer is None:
+            diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind=action, reason="missing_socket")
             await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
         try:
@@ -1052,6 +1174,7 @@ async def on_text(state: RelayState, connection: Connection, raw: str) -> None:
             await peer.send(forwarded)
         except Exception:
             state.mac_sockets.pop(link["device_id"], None)
+            diag("forward.mac_offline", link_id=link_id, device_id=link["device_id"], request_id=request_id, kind=action, reason="send_failed")
             await connection.send({"op": "error", "code": "mac_offline", "request_id": request_id, "message": "Mac 不在线"})
             return
         await connection.send({"op": "accepted", "request_id": request_id})
@@ -1115,7 +1238,8 @@ async def handle(reader, writer, state: RelayState) -> None:
             pass
 
 
-async def serve(host: str, port: int, data_path: str | None, cert: str, key: str) -> None:
+async def serve(host: str, port: int, data_path: str | None, cert: str, key: str, diag_dir: str | None = None) -> None:
+    configure_diag(diag_dir)
     state = RelayState(data_path)
     ssl_context = None
     if cert and key:
@@ -1128,6 +1252,7 @@ async def serve(host: str, port: int, data_path: str | None, cert: str, key: str
         ssl=ssl_context,
     )
     bound = server.sockets[0].getsockname()
+    diag("relay.start", host=str(bound[0]), port=int(bound[1]))
     print(f"READY {bound[0]} {bound[1]}", flush=True)
     async with server:
         await server.serve_forever()
@@ -1140,8 +1265,9 @@ def main() -> None:
     parser.add_argument("--data", default="")
     parser.add_argument("--cert", default="")
     parser.add_argument("--key", default="")
+    parser.add_argument("--diag", default="", help="诊断 JSONL 目录，默认 diagnostics 或 TOCODE_DIAG_DIR")
     args = parser.parse_args()
-    asyncio.run(serve(args.host, args.port, args.data or None, args.cert, args.key))
+    asyncio.run(serve(args.host, args.port, args.data or None, args.cert, args.key, args.diag or None))
 
 
 if __name__ == "__main__":
