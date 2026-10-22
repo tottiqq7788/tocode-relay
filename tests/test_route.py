@@ -10,6 +10,9 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import server
 
+BINDING_KEY = "mac-binding-secret"
+BINDING_DIGEST = hashlib.sha256(BINDING_KEY.encode()).hexdigest()
+
 
 def encode_client_frame(opcode: int, payload: bytes) -> bytes:
     mask = os.urandom(4)
@@ -132,23 +135,29 @@ class RouteTests(unittest.TestCase):
             try:
                 _, mac_a = await http(port, "POST", "/v1/devices", {"name": "Mac A"})
                 _, mac_b = await http(port, "POST", "/v1/devices", {"name": "Mac B"})
-                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac_a["device_token"])
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac_a["device_token"],
+                )
                 status, link = await http(
                     port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
-                    {"android_id": "phone", "android_name": "Pixel"},
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
                 )
                 self.assertEqual(status, 200)
                 self.assertNotIn("role_id", link)
                 status, again = await http(
                     port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
-                    {"android_id": "phone", "android_name": "Pixel"},
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
                 )
                 self.assertEqual(status, 409)
 
-                _, pairing_b = await http(port, "POST", "/v1/pairings", {}, mac_b["device_token"])
+                _, pairing_b = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac_b["device_token"],
+                )
                 _, link_b = await http(
                     port, "POST", f"/v1/pairings/{pairing_b['code']}/redeem",
-                    {"android_id": "phone", "android_name": "Pixel"},
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
                 )
 
                 mac = await open_ws(port, mac_a["device_token"])
@@ -285,10 +294,13 @@ class AppChannelTests(unittest.TestCase):
             clients = []
             try:
                 _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
-                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac["device_token"])
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac["device_token"],
+                )
                 _, link = await http(
                     port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
-                    {"android_id": "phone", "android_name": "Pixel"},
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
                 )
                 mac_ws = await open_ws(port, mac["device_token"])
                 phone = await open_ws(port, link["link_token"])
@@ -492,10 +504,13 @@ class AppChannelTests(unittest.TestCase):
             clients = []
             try:
                 _, mac_a = await http(port, "POST", "/v1/devices", {"name": "Mac A"})
-                _, pairing = await http(port, "POST", "/v1/pairings", {}, mac_a["device_token"])
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac_a["device_token"],
+                )
                 _, link = await http(
                     port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
-                    {"android_id": "phone", "android_name": "Pixel"},
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
                 )
                 mac = await open_ws(port, mac_a["device_token"])
                 phone = await open_ws(port, link["link_token"])
@@ -637,6 +652,81 @@ class AppChannelTests(unittest.TestCase):
             finally:
                 for client in clients:
                     client.writer.close()
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
+class BindingKeyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pairing_requires_digest_and_redeem_checks_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                holder["state"] = state
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            try:
+                _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+                status, missing = await http(port, "POST", "/v1/pairings", {}, mac["device_token"])
+                self.assertEqual(status, 400)
+                self.assertEqual(missing.get("error"), "missing_binding_key_digest")
+
+                status, forbidden = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST, "binding_key": BINDING_KEY},
+                    mac["device_token"],
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(forbidden.get("error"), "forbidden_field")
+
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac["device_token"],
+                )
+                status, wrong = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "binding_key": "wrong-key"},
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(wrong.get("error"), "unauthorized")
+                self.assertEqual(holder["state"].links, {})
+
+                status, missing_key = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone"},
+                )
+                self.assertEqual(status, 401)
+
+                status, link = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
+                )
+                self.assertEqual(status, 200)
+                self.assertIn("link_token", link)
+                saved = pathlib.Path(data).read_text(encoding="utf-8")
+                self.assertNotIn(BINDING_KEY, saved)
+                self.assertNotIn(BINDING_DIGEST, saved)
+                self.assertNotIn("binding_key", saved)
+            finally:
                 holder["server"].close()
                 task.cancel()
                 try:

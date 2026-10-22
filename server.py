@@ -119,9 +119,14 @@ class RelayState:
 
     def create_pairing(self, token: str, body: dict) -> dict:
         self._reject_forbidden(body)
+        if "binding_key" in body:
+            raise RelayError(400, "forbidden_field")
         device = self.device_for_token(token)
         if device is None:
             raise RelayError(401, "unauthorized")
+        digest = str(body.get("binding_key_digest") or "").strip().lower()
+        if not digest or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise RelayError(400, "missing_binding_key_digest")
         self._purge_pairings()
         code = self._new_code()
         self.pairings[code] = {
@@ -130,6 +135,7 @@ class RelayState:
             "device_id": device["id"],
             "expires_at": time.time() + PAIRING_TTL,
             "link_id": None,
+            "binding_key_digest": digest,
         }
         return {"code": code, "expires_at": int(self.pairings[code]["expires_at"])}
 
@@ -154,6 +160,13 @@ class RelayState:
             raise RelayError(409, "used")
         if time.time() >= pairing["expires_at"]:
             raise RelayError(410, "expired")
+        binding_key = str(body.get("binding_key") or "")
+        if not binding_key:
+            raise RelayError(401, "unauthorized")
+        expected = str(pairing.get("binding_key_digest") or "")
+        presented = hashlib.sha256(binding_key.encode("utf-8")).hexdigest()
+        if not expected or not hmac.compare_digest(presented, expected):
+            raise RelayError(401, "unauthorized")
         android_id = str(body.get("android_id") or "").strip()
         android_name = str(body.get("android_name") or "Android").strip()
         if not android_id:
@@ -171,6 +184,7 @@ class RelayState:
         }
         self.links[link_id] = link
         pairing["link_id"] = link_id
+        pairing.pop("binding_key_digest", None)
         self._save()
         public = self._public_link(link)
         public["link_token"] = link_token
