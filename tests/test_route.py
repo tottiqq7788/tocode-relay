@@ -83,7 +83,7 @@ async def open_ws(port: int, token: str) -> Socket:
     return sock
 
 
-async def http(port: int, method: str, path: str, body: dict | None = None, token: str = ""):
+async def http(port: int, method: str, path: str, body: dict | None = None, token: str = "", extra_headers: dict | None = None):
     raw = b"" if body is None else json.dumps(body).encode()
     header = (
         f"{method} {path} HTTP/1.1\r\n"
@@ -93,6 +93,9 @@ async def http(port: int, method: str, path: str, body: dict | None = None, toke
     )
     if token:
         header += f"Authorization: Bearer {token}\r\n"
+    if extra_headers:
+        for key, value in extra_headers.items():
+            header += f"{key}: {value}\r\n"
     header += "Connection: close\r\n\r\n"
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(header.encode() + raw)
@@ -867,5 +870,115 @@ class DiagTests(unittest.TestCase):
                     pass
 
 
+class BookmarkRoomTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bookmark_room_put_get_revision_and_isolation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["state"] = state
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            try:
+                room_id = "a" * 64
+                verifier = "b" * 64
+                cipher = base64.b64encode(b"opaque-bookmark-blob").decode()
+                status, payload = await http(
+                    port,
+                    "PUT",
+                    f"/v1/bookmark-rooms/{room_id}",
+                    {
+                        "room_id": room_id,
+                        "verifier": verifier,
+                        "ciphertext": cipher,
+                        "revision": 1,
+                        "expected_revision": 0,
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["revision"], 1)
+                self.assertEqual(payload["ciphertext"], cipher)
+
+                status, got = await http(
+                    port,
+                    "GET",
+                    f"/v1/bookmark-rooms/{room_id}",
+                    extra_headers={"X-Tocode-Bookmark-Verifier": verifier},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(got["ciphertext"], cipher)
+
+                status, _ = await http(
+                    port,
+                    "GET",
+                    f"/v1/bookmark-rooms/{room_id}",
+                    extra_headers={"X-Tocode-Bookmark-Verifier": "c" * 64},
+                )
+                self.assertEqual(status, 401)
+
+                status, conflict = await http(
+                    port,
+                    "PUT",
+                    f"/v1/bookmark-rooms/{room_id}",
+                    {
+                        "verifier": verifier,
+                        "ciphertext": cipher,
+                        "revision": 1,
+                        "expected_revision": 0,
+                    },
+                )
+                self.assertEqual(status, 409)
+                self.assertEqual(conflict["error"], "revision_conflict")
+
+                status, ok = await http(
+                    port,
+                    "PUT",
+                    f"/v1/bookmark-rooms/{room_id}",
+                    {
+                        "verifier": verifier,
+                        "ciphertext": cipher + "x",
+                        "revision": 2,
+                        "expected_revision": 1,
+                    },
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(ok["revision"], 2)
+
+                routes_path = pathlib.Path(data)
+                if routes_path.exists():
+                    blob = routes_path.read_text(encoding="utf-8")
+                    self.assertNotIn(cipher, blob)
+                    self.assertNotIn("ciphertext", blob)
+                    self.assertNotIn(verifier, blob)
+                rooms_path = pathlib.Path(directory) / "bookmark-rooms.json"
+                self.assertTrue(rooms_path.is_file())
+                rooms = json.loads(rooms_path.read_text(encoding="utf-8"))
+                self.assertEqual(rooms["rooms"][0]["room_id"], room_id)
+                self.assertEqual(rooms["rooms"][0]["verifier"], verifier)
+            finally:
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 if __name__ == "__main__":
     unittest.main()
+

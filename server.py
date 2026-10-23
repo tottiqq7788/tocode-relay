@@ -29,7 +29,11 @@ DIAG_BLOCKED = {
     "token", "device_token", "link_token", "authorization", "binding_key",
     "binding_key_digest", "text", "content", "body", "path", "caption",
     "bytes", "data", "password", "secret", "prompt", "api_key", "bot_token",
+    "verifier", "ciphertext", "room_id",
 }
+BOOKMARK_CIPHERTEXT_MAX = 4_194_304
+BOOKMARK_ROOM_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+BOOKMARK_VERIFIER_RE = re.compile(r"^[0-9a-f]{64}$")
 _diag_lock = threading.Lock()
 _diag_dir: Path | None = None
 
@@ -166,6 +170,85 @@ class Connection:
                 raise ConnectionError("closed")
 
 
+class BookmarkRoomStore:
+    """书签密文房间：与 routes.json 分开，只存 room_id / verifier / ciphertext / revision。"""
+
+    def __init__(self, data_path: str | None):
+        self.path: Path | None = None
+        self.rooms: dict[str, dict] = {}
+        if data_path:
+            self.path = Path(data_path).with_name("bookmark-rooms.json")
+            self._load()
+
+    def get(self, room_id: str, verifier: str) -> dict:
+        room = self.rooms.get(room_id)
+        if room is None:
+            raise RelayError(404, "not_found")
+        if not hmac.compare_digest(str(room.get("verifier") or ""), verifier):
+            raise RelayError(401, "unauthorized")
+        return {
+            "room_id": room_id,
+            "ciphertext": room["ciphertext"],
+            "revision": int(room["revision"]),
+        }
+
+    def put(self, room_id: str, body: dict) -> dict:
+        verifier = str(body.get("verifier") or "").strip().lower()
+        ciphertext = str(body.get("ciphertext") or "")
+        if not BOOKMARK_VERIFIER_RE.match(verifier):
+            raise RelayError(400, "bad_verifier")
+        if not ciphertext or len(ciphertext.encode("utf-8")) > BOOKMARK_CIPHERTEXT_MAX:
+            raise RelayError(400, "bad_ciphertext")
+        try:
+            revision = int(body.get("revision"))
+            expected = int(body.get("expected_revision"))
+        except (TypeError, ValueError):
+            raise RelayError(400, "bad_revision") from None
+        if revision < 1 or expected < 0 or revision != expected + 1:
+            raise RelayError(400, "bad_revision")
+
+        existing = self.rooms.get(room_id)
+        if existing is None:
+            if expected != 0:
+                raise RelayError(409, "revision_conflict")
+        else:
+            if not hmac.compare_digest(str(existing.get("verifier") or ""), verifier):
+                raise RelayError(401, "unauthorized")
+            if int(existing["revision"]) != expected:
+                raise RelayError(409, "revision_conflict")
+
+        self.rooms[room_id] = {
+            "room_id": room_id,
+            "verifier": verifier,
+            "ciphertext": ciphertext,
+            "revision": revision,
+        }
+        self._save()
+        return {
+            "room_id": room_id,
+            "ciphertext": ciphertext,
+            "revision": revision,
+        }
+
+    def _load(self) -> None:
+        if self.path is None or not self.path.exists():
+            return
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        for room in raw.get("rooms", []):
+            room_id = str(room.get("room_id") or "")
+            if BOOKMARK_ROOM_ID_RE.match(room_id):
+                self.rooms[room_id] = room
+
+    def _save(self) -> None:
+        if self.path is None:
+            return
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
+        payload = {"rooms": list(self.rooms.values())}
+        self.path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.chmod(self.path, 0o600)
+
+
 class RelayState:
     def __init__(self, data_path: str | None):
         self.data_path = data_path
@@ -175,6 +258,7 @@ class RelayState:
         self.mac_sockets: dict[str, Connection] = {}
         self.android_sockets: dict[str, Connection] = {}
         self.stored_messages: list = []
+        self.bookmark_rooms = BookmarkRoomStore(data_path)
         if data_path:
             self._load()
 
@@ -502,6 +586,19 @@ def route_http(state: RelayState, method: str, path: str, headers: dict, body: d
     if method == "POST" and path.startswith("/v1/pairings/") and path.endswith("/redeem"):
         code = path.removeprefix("/v1/pairings/").removesuffix("/redeem").strip("/")
         return state.redeem(code, body), 200
+    if path.startswith("/v1/bookmark-rooms/"):
+        room_id = path.removeprefix("/v1/bookmark-rooms/").strip("/")
+        if not BOOKMARK_ROOM_ID_RE.match(room_id):
+            raise RelayError(400, "bad_room_id")
+        if method == "GET":
+            verifier = str(headers.get("x-tocode-bookmark-verifier") or "").strip().lower()
+            if not BOOKMARK_VERIFIER_RE.match(verifier):
+                raise RelayError(401, "unauthorized")
+            return state.bookmark_rooms.get(room_id, verifier), 200
+        if method == "PUT":
+            if str(body.get("room_id") or "") and str(body.get("room_id")) != room_id:
+                raise RelayError(400, "bad_room_id")
+            return state.bookmark_rooms.put(room_id, body), 200
     raise RelayError(404, "not_found")
 
 
