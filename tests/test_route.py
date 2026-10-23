@@ -355,6 +355,37 @@ class AppChannelTests(unittest.TestCase):
                 self.assertNotIn("liubei", saved)
                 self.assertNotIn("p_abc12345", saved)
 
+                await phone.send({
+                    "op": "app", "request_id": "m1", "kind": "models",
+                    "profile": "liubei",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "models")
+                self.assertEqual(routed["profile"], "liubei")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+
+                await phone.send({
+                    "op": "app", "request_id": "m2", "kind": "model_select",
+                    "profile": "liubei", "title": "deepseek", "text": "deepseek-flash",
+                })
+                routed = await mac_ws.recv()
+                self.assertEqual(routed["kind"], "model_select")
+                self.assertEqual(routed["title"], "deepseek")
+                self.assertEqual(routed["text"], "deepseek-flash")
+                self.assertEqual((await phone.recv())["op"], "accepted")
+
+                await phone.send({
+                    "op": "app", "request_id": "m3", "kind": "model_select",
+                    "profile": "liubei", "title": "Bad Provider", "text": "deepseek-flash",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+
+                await phone.send({
+                    "op": "app", "request_id": "m4", "kind": "models",
+                    "profile": "liubei", "text": "extra",
+                })
+                self.assertEqual((await phone.recv())["code"], "bad_action")
+
                 for index, bad in enumerate(["/etc", "code/../..", "./code", "code//app", "code/\x00", "a" * 1025]):
                     await phone.send({"op": "app", "request_id": f"f{index}", "kind": "folders", "path": bad})
                     self.assertEqual((await phone.recv())["code"], "bad_action")

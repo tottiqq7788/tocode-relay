@@ -116,7 +116,10 @@ APP_KINDS = {
     "status", "sessions", "session_create", "messages", "chat", "tree",
     "profiles", "profile_select", "projects", "project_create", "folders",
     "session_delete", "session_rename", "preview", "download",
+    "models", "model_select",
 }
+MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/+-]{0,199}$")
+PROVIDER_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 APP_FIELDS = {"op", "request_id", "kind", "session_id", "title", "text", "profile", "project_id", "path", "offset", "cursor"}
 CURSOR_RE = re.compile(r"^(tail|older):[0-9]{1,20}$")
 PATH_LIMIT = 1024
@@ -1012,6 +1015,14 @@ def app_request_error(message: dict) -> str | None:
         if kind != "messages" or not isinstance(cursor, str) or CURSOR_RE.fullmatch(cursor) is None:
             return "bad_action"
         if cursor.startswith("older:") and int(cursor.split(":", 1)[1]) <= 0:
+            return "bad_action"
+    if kind == "model_select":
+        if MODEL_RE.fullmatch(text) is None or PROVIDER_RE.fullmatch(title) is None:
+            return "bad_action"
+        if session_id or project_id or path:
+            return "bad_action"
+    if kind == "models":
+        if text or title or session_id or project_id or path:
             return "bad_action"
     return None
 
