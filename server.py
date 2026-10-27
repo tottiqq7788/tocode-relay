@@ -25,6 +25,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+WS_AUTH_TIMEOUT = 5.0
+# Transition: accept legacy ?token= until all clients send first-frame auth. Set False at cutover.
+WS_ALLOW_QUERY_TOKEN = False
 DIAG_BLOCKED = {
     "token", "device_token", "link_token", "authorization", "binding_key",
     "binding_key_digest", "text", "content", "body", "path", "caption",
@@ -497,20 +500,45 @@ async def read_http(reader: asyncio.StreamReader):
     return lines[0], headers, body, leftover
 
 
-def http_response(status: int, payload: dict) -> bytes:
+def browser_pair_cors(method: str, path: str) -> bool:
+    """Allow browsers to redeem pairing codes and unlink; other routes stay closed."""
+    if method == "OPTIONS":
+        if path.startswith("/v1/pairings/") and path.endswith("/redeem"):
+            return True
+        if path.startswith("/v1/links/") and path != "/v1/links/":
+            return True
+        return False
+    if method == "POST" and path.startswith("/v1/pairings/") and path.endswith("/redeem"):
+        return True
+    if method == "DELETE" and path.startswith("/v1/links/") and path != "/v1/links/":
+        return True
+    return False
+
+
+def http_response(status: int, payload: dict, cors: bool = False) -> bytes:
     raw = json.dumps(payload, ensure_ascii=False).encode()
     reason = {
         200: "OK",
+        204: "No Content",
         400: "Bad Request",
         401: "Unauthorized",
         404: "Not Found",
         409: "Conflict",
         410: "Gone",
     }.get(status, "Error")
+    cors_headers = ""
+    if cors:
+        cors_headers = (
+            "Access-Control-Allow-Origin: *\r\n"
+            "Access-Control-Allow-Methods: POST, DELETE, OPTIONS\r\n"
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+            "Access-Control-Max-Age: 86400\r\n"
+        )
     head = (
         f"HTTP/1.1 {status} {reason}\r\n"
         "Content-Type: application/json\r\n"
         f"Content-Length: {len(raw)}\r\n"
+        f"{cors_headers}"
         "Connection: close\r\n\r\n"
     )
     return head.encode() + raw
@@ -547,6 +575,12 @@ async def dispatch(reader, writer, state: RelayState) -> None:
     if headers.get("upgrade", "").lower() == "websocket":
         await serve_socket(reader, writer, state, target, headers, leftover)
         return
+    cors = browser_pair_cors(method, path)
+    if method == "OPTIONS" and cors:
+        writer.write(http_response(204, {}, cors=True))
+        await writer.drain()
+        writer.close()
+        return
     if method == "DELETE" and path.startswith("/v1/links/"):
         try:
             removed = state.take_link(bearer(headers), path.removeprefix("/v1/links/"))
@@ -554,7 +588,7 @@ async def dispatch(reader, writer, state: RelayState) -> None:
             result, status = {"ok": True}, 200
         except RelayError as error:
             result, status = {"error": error.code}, error.status
-        writer.write(http_response(status, result))
+        writer.write(http_response(status, result, cors=cors))
         await writer.drain()
         writer.close()
         return
@@ -567,7 +601,7 @@ async def dispatch(reader, writer, state: RelayState) -> None:
         result, status = {"error": error.code}, error.status
     except json.JSONDecodeError:
         result, status = {"error": "bad_json"}, 400
-    writer.write(http_response(status, result))
+    writer.write(http_response(status, result, cors=cors))
     await writer.drain()
     writer.close()
 
@@ -602,14 +636,48 @@ def route_http(state: RelayState, method: str, path: str, headers: dict, body: d
     raise RelayError(404, "not_found")
 
 
+async def await_ws_auth(stream: ByteStream, state: RelayState):
+    """First text frame must be {op:auth,token}. Returns (side, owner) or None."""
+    try:
+        opcode, payload = await asyncio.wait_for(read_frame(stream), timeout=WS_AUTH_TIMEOUT)
+    except (asyncio.TimeoutError, EOFError, asyncio.IncompleteReadError, ValueError, ConnectionError):
+        return None
+    if opcode == 8:
+        return None
+    if opcode != 1:
+        return None
+    try:
+        body = json.loads(payload.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict) or body.get("op") != "auth":
+        return None
+    token = str(body.get("token") or "")
+    if not token:
+        return None
+    return state.identify(token)
+
+
 async def serve_socket(reader, writer, state: RelayState, target: str, headers: dict, leftover: bytes):
-    token = query_token(target)
-    identity = state.identify(token)
-    if identity is None or path_of(target) != "/v1/ws":
+    if path_of(target) != "/v1/ws":
         writer.write(http_response(401, {"error": "unauthorized"}))
         await writer.drain()
         writer.close()
         return
+    query = query_token(target)
+    identity = None
+    if query:
+        if not WS_ALLOW_QUERY_TOKEN:
+            writer.write(http_response(401, {"error": "unauthorized"}))
+            await writer.drain()
+            writer.close()
+            return
+        identity = state.identify(query)
+        if identity is None:
+            writer.write(http_response(401, {"error": "unauthorized"}))
+            await writer.drain()
+            writer.close()
+            return
     accept = base64.b64encode(
         hashlib.sha1((headers.get("sec-websocket-key", "") + WS_GUID).encode()).digest()
     ).decode()
@@ -622,6 +690,13 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
         ).encode()
     )
     await writer.drain()
+    stream = ByteStream(reader, leftover)
+    if identity is None:
+        identity = await await_ws_auth(stream, state)
+        if identity is None:
+            diag("ws.auth_fail", reason="auth_timeout_or_bad")
+            writer.close()
+            return
     side, owner = identity
     connection = Connection(writer, side, owner)
     close_reason = "unknown"
@@ -640,7 +715,6 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
         previous.writer.close()
     try:
         await connection.send(ready)
-        stream = ByteStream(reader, leftover)
         while True:
             opcode, payload = await read_frame(stream)
             if opcode == 8:

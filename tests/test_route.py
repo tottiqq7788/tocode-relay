@@ -55,12 +55,13 @@ class Socket:
         await self.writer.drain()
 
 
-async def open_ws(port: int, token: str) -> Socket:
+async def open_ws(port: int, token: str, *, via_query: bool = False) -> Socket:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     key = base64.b64encode(os.urandom(16)).decode()
+    path = f"/v1/ws?token={token}" if via_query else "/v1/ws"
     writer.write(
         (
-            f"GET /v1/ws?token={token} HTTP/1.1\r\n"
+            f"GET {path} HTTP/1.1\r\n"
             "Host: 127.0.0.1\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
@@ -80,10 +81,17 @@ async def open_ws(port: int, token: str) -> Socket:
         raise AssertionError("accept")
     sock = Socket(reader, writer)
     sock.stream = server.ByteStream(reader, opened[3])
+    if not via_query:
+        await sock.send({"op": "auth", "token": token})
     return sock
 
 
 async def http(port: int, method: str, path: str, body: dict | None = None, token: str = "", extra_headers: dict | None = None):
+    status, payload, _headers = await http_full(port, method, path, body, token, extra_headers)
+    return status, payload
+
+
+async def http_full(port: int, method: str, path: str, body: dict | None = None, token: str = "", extra_headers: dict | None = None):
     raw = b"" if body is None else json.dumps(body).encode()
     header = (
         f"{method} {path} HTTP/1.1\r\n"
@@ -102,9 +110,9 @@ async def http(port: int, method: str, path: str, body: dict | None = None, toke
     await writer.drain()
     opened = await server.read_http(reader)
     status = int(opened[0].split(" ")[1])
-    payload = json.loads(opened[2].decode() or "{}")
+    payload = json.loads(opened[2].decode() or "{}") if opened[2] else {}
     writer.close()
-    return status, payload
+    return status, payload, opened[1]
 
 
 
@@ -703,6 +711,73 @@ class AppChannelTests(unittest.TestCase):
                     pass
 
 
+class BrowserCorsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_redeem_and_unlink_expose_cors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            try:
+                _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac["device_token"],
+                )
+                code = pairing["code"]
+                status, _body, preflight = await http_full(
+                    port, "OPTIONS", f"/v1/pairings/{code}/redeem",
+                    extra_headers={"Origin": "http://localhost:5173"},
+                )
+                self.assertEqual(status, 204)
+                self.assertEqual(preflight.get("access-control-allow-origin"), "*")
+                self.assertIn("POST", preflight.get("access-control-allow-methods", ""))
+
+                status, link, redeem_headers = await http_full(
+                    port, "POST", f"/v1/pairings/{code}/redeem",
+                    {"android_id": "web-1", "android_name": "Chrome", "binding_key": BINDING_KEY},
+                    extra_headers={"Origin": "http://localhost:5173"},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(redeem_headers.get("access-control-allow-origin"), "*")
+                self.assertIn("link_token", link)
+
+                status, _ok, delete_headers = await http_full(
+                    port, "DELETE", f"/v1/links/{link['link_id']}",
+                    token=link["link_token"],
+                    extra_headers={"Origin": "http://localhost:5173"},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(delete_headers.get("access-control-allow-origin"), "*")
+
+                status, _health, health_headers = await http_full(port, "GET", "/health")
+                self.assertEqual(status, 200)
+                self.assertNotIn("access-control-allow-origin", health_headers)
+            finally:
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+
 class BindingKeyTests(unittest.IsolatedAsyncioTestCase):
     async def test_pairing_requires_digest_and_redeem_checks_key(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -868,6 +943,153 @@ class DiagTests(unittest.TestCase):
                     await task
                 except asyncio.CancelledError:
                     pass
+
+
+class WsAuthTests(unittest.IsolatedAsyncioTestCase):
+    async def _boot(self):
+        directory = tempfile.TemporaryDirectory()
+        data = str(pathlib.Path(directory.name) / "routes.json")
+        bound = asyncio.Event()
+        holder = {"tmpdir": directory}
+
+        async def boot():
+            state = server.RelayState(data)
+            tcp = await asyncio.start_server(
+                lambda reader, writer: server.handle(reader, writer, state),
+                "127.0.0.1",
+                0,
+            )
+            holder["server"] = tcp
+            holder["port"] = tcp.sockets[0].getsockname()[1]
+            bound.set()
+            async with tcp:
+                await tcp.serve_forever()
+
+        task = asyncio.create_task(boot())
+        await asyncio.wait_for(bound.wait(), 3)
+        holder["task"] = task
+        return holder
+
+    async def _stop(self, holder):
+        holder["server"].close()
+        holder["task"].cancel()
+        try:
+            await holder["task"]
+        except asyncio.CancelledError:
+            pass
+        holder["tmpdir"].cleanup()
+
+    async def test_first_frame_auth_ready(self):
+        holder = await self._boot()
+        try:
+            port = holder["port"]
+            _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+            sock = await open_ws(port, mac["device_token"])
+            ready = await sock.recv()
+            self.assertEqual(ready["op"], "ready")
+            self.assertEqual(ready["side"], "mac")
+            sock.writer.close()
+        finally:
+            await self._stop(holder)
+
+    async def test_query_token_still_accepted_during_transition(self):
+        holder = await self._boot()
+        previous = server.WS_ALLOW_QUERY_TOKEN
+        server.WS_ALLOW_QUERY_TOKEN = True
+        try:
+            port = holder["port"]
+            _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+            sock = await open_ws(port, mac["device_token"], via_query=True)
+            ready = await sock.recv()
+            self.assertEqual(ready["side"], "mac")
+            sock.writer.close()
+        finally:
+            server.WS_ALLOW_QUERY_TOKEN = previous
+            await self._stop(holder)
+
+    async def test_query_token_rejected_after_cutover(self):
+        holder = await self._boot()
+        previous = server.WS_ALLOW_QUERY_TOKEN
+        server.WS_ALLOW_QUERY_TOKEN = False
+        try:
+            port = holder["port"]
+            _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            key = base64.b64encode(os.urandom(16)).decode()
+            writer.write(
+                (
+                    f"GET /v1/ws?token={mac['device_token']} HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode()
+            )
+            await writer.drain()
+            opened = await server.read_http(reader)
+            status = int(opened[0].split(" ")[1])
+            self.assertEqual(status, 401)
+            writer.close()
+        finally:
+            server.WS_ALLOW_QUERY_TOKEN = previous
+            await self._stop(holder)
+
+    async def test_bad_auth_frame_closes(self):
+        holder = await self._boot()
+        try:
+            port = holder["port"]
+            _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            key = base64.b64encode(os.urandom(16)).decode()
+            writer.write(
+                (
+                    "GET /v1/ws HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode()
+            )
+            await writer.drain()
+            opened = await server.read_http(reader)
+            self.assertIn(" 101 ", opened[0])
+            sock = Socket(reader, writer)
+            sock.stream = server.ByteStream(reader, opened[3])
+            await sock.send({"op": "auth", "token": "not-a-real-token"})
+            with self.assertRaises((EOFError, ConnectionError, OSError, asyncio.IncompleteReadError)):
+                await asyncio.wait_for(sock.recv_frame(), 2)
+        finally:
+            await self._stop(holder)
+
+    async def test_non_auth_first_frame_closes(self):
+        holder = await self._boot()
+        try:
+            port = holder["port"]
+            await http(port, "POST", "/v1/devices", {"name": "Mac"})
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            key = base64.b64encode(os.urandom(16)).decode()
+            writer.write(
+                (
+                    "GET /v1/ws HTTP/1.1\r\n"
+                    "Host: 127.0.0.1\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Key: {key}\r\n"
+                    "Sec-WebSocket-Version: 13\r\n\r\n"
+                ).encode()
+            )
+            await writer.drain()
+            opened = await server.read_http(reader)
+            self.assertIn(" 101 ", opened[0])
+            sock = Socket(reader, writer)
+            sock.stream = server.ByteStream(reader, opened[3])
+            await sock.send({"op": "app", "kind": "status"})
+            with self.assertRaises((EOFError, ConnectionError, OSError, asyncio.IncompleteReadError)):
+                await asyncio.wait_for(sock.recv_frame(), 2)
+        finally:
+            await self._stop(holder)
 
 
 class BookmarkRoomTests(unittest.IsolatedAsyncioTestCase):
