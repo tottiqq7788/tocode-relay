@@ -700,16 +700,17 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
     side, owner = identity
     connection = Connection(writer, side, owner)
     close_reason = "unknown"
+    ua = str(headers.get("user-agent") or "")[:120]
     if side == "mac":
         previous = state.mac_sockets.get(owner)
         state.mac_sockets[owner] = connection
         ready = {"op": "ready", "side": "mac", "link_ids": state.links_for_device(owner)}
-        diag("ws.accept", device_id=owner, side_peer="mac", links=len(ready["link_ids"]))
+        diag("ws.accept", device_id=owner, side_peer="mac", links=len(ready["link_ids"]), ua=ua)
     else:
         previous = state.android_sockets.get(owner)
         state.android_sockets[owner] = connection
         ready = {"op": "ready", "side": "android", "link_id": owner}
-        diag("ws.accept", link_id=owner, side_peer="android")
+        diag("ws.accept", link_id=owner, side_peer="android", ua=ua)
     if previous is not None and previous is not connection:
         diag("ws.replace", device_id=owner if side == "mac" else "", link_id=owner if side == "android" else "", side_peer=side)
         previous.writer.close()

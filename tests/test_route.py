@@ -55,10 +55,11 @@ class Socket:
         await self.writer.drain()
 
 
-async def open_ws(port: int, token: str, *, via_query: bool = False) -> Socket:
+async def open_ws(port: int, token: str, *, via_query: bool = False, user_agent: str = "") -> Socket:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     key = base64.b64encode(os.urandom(16)).decode()
     path = f"/v1/ws?token={token}" if via_query else "/v1/ws"
+    ua_line = f"User-Agent: {user_agent}\r\n" if user_agent else ""
     writer.write(
         (
             f"GET {path} HTTP/1.1\r\n"
@@ -66,7 +67,9 @@ async def open_ws(port: int, token: str, *, via_query: bool = False) -> Socket:
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n"
+            "Sec-WebSocket-Version: 13\r\n"
+            f"{ua_line}"
+            "\r\n"
         ).encode()
     )
     await writer.drain()
@@ -919,7 +922,7 @@ class DiagTests(unittest.TestCase):
             port = holder["port"]
             try:
                 _, mac = await http(port, "POST", "/v1/devices", {"name": "Mac"})
-                sock = await open_ws(port, mac["device_token"])
+                sock = await open_ws(port, mac["device_token"], user_agent="TocodeToweb/0.1 test")
                 ready = await sock.recv()
                 self.assertEqual(ready["side"], "mac")
                 sock.writer.close()
@@ -931,6 +934,8 @@ class DiagTests(unittest.TestCase):
                 events = [row["event"] for row in lines]
                 self.assertIn("ws.accept", events)
                 self.assertIn("ws.close", events)
+                accept = next(row for row in lines if row["event"] == "ws.accept")
+                self.assertEqual(accept.get("detail", {}).get("ua"), "TocodeToweb/0.1 test")
                 close = next(row for row in lines if row["event"] == "ws.close")
                 self.assertEqual(close["device_id"], mac["device_id"])
                 self.assertIn(close.get("detail", {}).get("reason"), {"eof", "ws_close", "connection_error", "incomplete_read"})
