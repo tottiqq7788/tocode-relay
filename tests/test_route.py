@@ -949,6 +949,79 @@ class DiagTests(unittest.TestCase):
                 except asyncio.CancelledError:
                     pass
 
+    def test_second_socket_supersedes_the_first(self):
+        asyncio.run(self._second_socket_supersedes_the_first())
+
+    async def _second_socket_supersedes_the_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = str(pathlib.Path(directory) / "routes.json")
+            bound = asyncio.Event()
+            holder = {}
+
+            async def boot():
+                state = server.RelayState(data)
+                tcp = await asyncio.start_server(
+                    lambda reader, writer: server.handle(reader, writer, state),
+                    "127.0.0.1",
+                    0,
+                )
+                holder["server"] = tcp
+                holder["state"] = state
+                holder["port"] = tcp.sockets[0].getsockname()[1]
+                bound.set()
+                async with tcp:
+                    await tcp.serve_forever()
+
+            task = asyncio.create_task(boot())
+            await asyncio.wait_for(bound.wait(), 3)
+            port = holder["port"]
+            clients = []
+            try:
+                _, mac_body = await http(port, "POST", "/v1/devices", {"name": "Mac"})
+                _, pairing = await http(
+                    port, "POST", "/v1/pairings",
+                    {"binding_key_digest": BINDING_DIGEST}, mac_body["device_token"],
+                )
+                status, link = await http(
+                    port, "POST", f"/v1/pairings/{pairing['code']}/redeem",
+                    {"android_id": "phone", "android_name": "Pixel", "binding_key": BINDING_KEY},
+                )
+                self.assertEqual(status, 200)
+                mac = await open_ws(port, mac_body["device_token"])
+                first = await open_ws(port, link["link_token"])
+                clients.extend([mac, first])
+                self.assertEqual((await mac.recv())["side"], "mac")
+                self.assertEqual((await first.recv())["side"], "android")
+                second = await open_ws(port, link["link_token"])
+                clients.append(second)
+                opcode, payload = await first.recv_frame()
+                self.assertEqual(opcode, 8)
+                self.assertGreaterEqual(len(payload), 2)
+                self.assertEqual(int.from_bytes(payload[:2], "big"), server.WS_CLOSE_SUPERSEDED)
+                self.assertEqual(payload[2:].decode(), "superseded")
+                self.assertEqual((await second.recv())["side"], "android")
+                await second.send({"op": "command", "request_id": "r-new", "action": "remote-buttons"})
+                inbound = await mac.recv()
+                self.assertEqual(inbound["op"], "command_inbound")
+                self.assertEqual(inbound["request_id"], "r-new")
+                self.assertEqual((await second.recv())["op"], "accepted")
+                await mac.send({
+                    "op": "result", "link_id": link["link_id"], "request_id": "r-new",
+                    "ok": True, "text": "routed",
+                })
+                routed = await second.recv()
+                self.assertEqual(routed["op"], "result")
+                self.assertEqual(routed["text"], "routed")
+            finally:
+                for client in clients:
+                    client.writer.close()
+                holder["server"].close()
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
 
 class WsAuthTests(unittest.IsolatedAsyncioTestCase):
     async def _boot(self):

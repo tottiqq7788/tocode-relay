@@ -26,6 +26,8 @@ from pathlib import Path
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 WS_AUTH_TIMEOUT = 5.0
+# A newer socket for the same owner replaces the old one. 4001 tells the loser to stop timer retries.
+WS_CLOSE_SUPERSEDED = 4001
 # Transition: accept legacy ?token= until all clients send first-frame auth. Set False at cutover.
 WS_ALLOW_QUERY_TOKEN = False
 DIAG_BLOCKED = {
@@ -444,6 +446,22 @@ class ByteStream:
         return out
 
 
+def encode_close(code: int, reason: str) -> bytes:
+    return encode_frame(8, code.to_bytes(2, "big") + reason.encode())
+
+
+async def supersede(previous: Connection) -> None:
+    """Tell the replaced socket why it lost, then close it. The new socket stays routed."""
+    try:
+        async with previous.lock:
+            if not previous.writer.is_closing():
+                previous.writer.write(encode_close(WS_CLOSE_SUPERSEDED, "superseded"))
+                await previous.writer.drain()
+    except (ConnectionError, OSError, asyncio.TimeoutError):
+        pass
+    previous.writer.close()
+
+
 def encode_frame(opcode: int, payload: bytes) -> bytes:
     header = bytes([0x80 | opcode])
     length = len(payload)
@@ -713,7 +731,7 @@ async def serve_socket(reader, writer, state: RelayState, target: str, headers: 
         diag("ws.accept", link_id=owner, side_peer="android", ua=ua)
     if previous is not None and previous is not connection:
         diag("ws.replace", device_id=owner if side == "mac" else "", link_id=owner if side == "android" else "", side_peer=side)
-        previous.writer.close()
+        await supersede(previous)
     try:
         await connection.send(ready)
         while True:
